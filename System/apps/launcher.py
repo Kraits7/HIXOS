@@ -9,6 +9,37 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtGui import QPixmap, QFont, QColor, QBrush, QPainter, QLinearGradient
 from PyQt5.QtCore import Qt, pyqtSignal, QSize, QPoint, QPropertyAnimation, QEasingCurve, QRect, pyqtProperty, QParallelAnimationGroup, QSequentialAnimationGroup, QTimer, QPauseAnimation
 
+# --- Системный движок анимаций (OxygenOS / iOS style) ---
+try:
+    from ui.animation_engine import Easing, Duration, animate, _FrameDriver
+except ImportError:  # запуск лаунчера standalone из папки apps
+    from animation_engine import Easing, Duration, animate, _FrameDriver
+
+
+class SpringScaleAnimator(QObject):
+    """Spring-анимация масштаба иконки в стиле iOS/OxygenOS.
+
+    Кастомные cubic-bezier кривые нельзя передавать в QPropertyAnimation
+    (PyQt копирует их на C++ сторону с потерей типа), поэтому анимация
+    progress идёт покадрово через _FrameDriver со скоростью ~60 FPS.
+    """
+
+    def __init__(self, icon):
+        super().__init__(icon)
+        self._icon = icon
+        self._driver = None
+
+    def to(self, target: float, duration: int, curve):
+        start = self._icon.scale_value  # текущее значение — плавный перехват
+        if self._driver:
+            self._driver.stop()
+
+        def on_frame(p):
+            self._icon.set_scale(start + (target - start) * p)
+
+        self._driver = _FrameDriver(duration, curve, on_frame, parent=self)
+        self._driver.start()
+
 # Класс для одной иконки приложения
 class AppIcon(QWidget):
     # Сигнал, который будет обрабатываться LauncherContent.
@@ -34,6 +65,9 @@ class AppIcon(QWidget):
         self._scale_factor = 1.0 # Текущий коэффициент масштабирования для анимации
         self._opacity = 1.0 # Текущая прозрачность для анимации (добавлено)
         self._original_pixmap = None # Для хранения оригинального немасштабированного QPixmap
+
+        # Spring-аниматор масштаба (OxygenOS/iOS style, покадровый, 60 FPS)
+        self._spring = SpringScaleAnimator(self)
         
         # Загрузка оригинального pixmap один раз
         pixmap_loaded = QPixmap(icon_path)
@@ -85,6 +119,14 @@ class AppIcon(QWidget):
         if self._scale_factor != value:
             self._scale_factor = value
             self.update() # Запрос на перерисовку при изменении масштаба
+
+    # Алиасы для spring-аниматора (покадрового, вне QPropertyAnimation)
+    @property
+    def scale_value(self):
+        return self._scale_factor
+
+    def set_scale(self, value: float):
+        self.scale = value
 
     # Определение пользовательского свойства 'opacity' для анимации (добавлено)
     @pyqtProperty(float)
@@ -152,14 +194,9 @@ class AppIcon(QWidget):
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
-            # Анимация сжатия при нажатии
-            self.animation = QPropertyAnimation(self, b"scale")
-            self.animation.setDuration(100) # Быстрое сжатие (100 мс)
-            self.animation.setStartValue(self._scale_factor)
-            self.animation.setEndValue(0.85) # Сжимаем до 85% от оригинального размера
-            self.animation.setEasingCurve(QEasingCurve.OutQuad) # Быстрое начало, замедление к концу
-            self.animation.start()
-            
+            # iOS-style press feedback: быстрое мягкое сжатие до 0.85
+            self._spring.to(0.85, Duration.MICRO, Easing.STANDARD)
+
             # Эмитируем сигнал, который будет перехвачен LauncherContent,
             # передавая глобальную геометрию иконки.
             global_top_left = self.mapToGlobal(self.rect().topLeft())
@@ -169,13 +206,8 @@ class AppIcon(QWidget):
 
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.LeftButton:
-            # Анимация возвращения с "отскоком"
-            self.animation = QPropertyAnimation(self, b"scale")
-            self.animation.setDuration(300) # Медленнее возвращение (300 мс)
-            self.animation.setStartValue(self._scale_factor)
-            self.animation.setEndValue(1.0) # Возвращаемся к нормальному размеру
-            self.animation.setEasingCurve(QEasingCurve.OutElastic) # Эластичный эффект "отскока"
-            self.animation.start()
+            # Возврат с spring-overshoot (cubic-bezier(0.34,1.56,0.64,1)) — как в iOS
+            self._spring.to(1.0, Duration.SHORT, Easing.SPRING)
         super().mouseReleaseEvent(event)
 
     def reset_animation_state(self):

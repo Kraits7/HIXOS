@@ -148,14 +148,30 @@ class DummyDataManager:
 
 # Class for the boot screen
 class BootScreenContent(QFrame):
+    """iOS/OxygenOS-style загрузка: логотип по центру (KeepAspectRatio — без
+    растягивания), плавное fade-in пружинкой и тонкий progress-бар внизу."""
     def __init__(self, parent=None, image_path='Boot.png'): 
         super().__init__(parent)
         self.main_window = parent
         self.image_path = image_path
         self.boot_timer = QTimer(self) 
+        self._progress_value = 0.0
         self.init_ui()
 
+    def _find_image(self):
+        candidates = [
+            self.image_path,
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), 'boot.png'),
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), 'Boot.png'),
+            'boot.png', 'Boot.png',
+        ]
+        for c in candidates:
+            if c and os.path.exists(c):
+                return c
+        return None
+
     def init_ui(self):
+        self.setStyleSheet("background-color: #000000;")
         self.layout = QVBoxLayout(self)
         self.layout.setContentsMargins(0, 0, 0, 0)
         self.layout.setSpacing(0)
@@ -163,25 +179,72 @@ class BootScreenContent(QFrame):
         self.image_label = QLabel(self)
         self.image_label.setAlignment(Qt.AlignCenter)
         self.image_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.layout.addWidget(self.image_label)
+        self.layout.addStretch(1)
+        self.layout.addWidget(self.image_label, 3)
+        self.layout.addStretch(2)
 
-        if os.path.exists(self.image_path):
-            pixmap = QPixmap(self.image_path)
-            if not pixmap.isNull():
-                self.image_label.setPixmap(pixmap)
-                self.image_label.setScaledContents(True) 
-                self.image_label.setStyleSheet("background-color: black;") 
-            else:
-                self.image_label.setText(f"Error: Image '{self.image_path}' not found.")
-                self.image_label.setStyleSheet("color: white; font-size: 16px; font-weight: bold; background-color: black;")
+        img_path = self._find_image()
+        if img_path:
+            self._pixmap = QPixmap(img_path)
         else:
-            self.image_label.setText(f"Error: Image file '{self.image_path}' not found.")
-            self.image_label.setStyleSheet("color: white; font-size: 16px; font-weight: bold; background-color: black;")
-        
+            self._pixmap = QPixmap()
+        if not self._pixmap.isNull():
+            self.image_label.setPixmap(self._pixmap.scaled(
+                240, 240, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        else:
+            self.image_label.setText("HIX OS")
+            self.image_label.setStyleSheet("color: white; font-size: 34px; font-weight: 700;")
+
+        # Тонкий прогресс-бар в стиле iOS boot
+        self.progress_track = QFrame(self)
+        self.progress_track.setFixedHeight(3)
+        self.progress_track.setStyleSheet("background-color: rgba(255,255,255,0.12); border-radius: 1px;")
+        self.progress_fill = QFrame(self.progress_track)
+        self.progress_fill.setGeometry(0, 0, 0, 3)
+        self.progress_fill.setStyleSheet("background-color: #FFFFFF; border-radius: 1px;")
+        bottom = QVBoxLayout()
+        bottom.setContentsMargins(90, 0, 90, 60)
+        bottom.addWidget(self.progress_track)
+        self.layout.addLayout(bottom)
+
+        # Fade-in логотипа (spring feel через OUT_BACK)
+        self._fade_eff = QGraphicsOpacityEffect(self.image_label)
+        self.image_label.setGraphicsEffect(self._fade_eff)
+        self._fade_anim = QPropertyAnimation(self._fade_eff, b"opacity", self)
+        self._fade_anim.setDuration(900)
+        self._fade_anim.setStartValue(0.0)
+        self._fade_anim.setEndValue(1.0)
+        self._fade_anim.setEasingCurve(Easing.DECELERATE)
+        self._fade_anim.start()
+
+        # Плавный недостижимый прогресс (как при реальной загрузке)
+        self._progress_timer = QTimer(self)
+        self._progress_timer.timeout.connect(self._tick_progress)
+        self._progress_timer.start(80)
+
         self.boot_timer.singleShot(5000, self.start_initial_setup) 
+
+    def _tick_progress(self):
+        # ease-out кривая: быстро в начале, медленно к ~92%
+        target = 0.92
+        self._progress_value += (target - self._progress_value) * 0.045
+        w = int(self.progress_track.width() * self._progress_value)
+        self.progress_fill.setGeometry(0, 0, max(0, w), 3)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        w = int(self.progress_track.width() * self._progress_value)
+        self.progress_fill.setGeometry(0, 0, max(0, w), 3)
 
     def start_initial_setup(self):
         print("Boot screen finished. Transitioning to initial setup...")
+        # Дотягиваем прогресс до конца и короткой паузой даём дорисоваться
+        self._progress_timer.stop()
+        self._progress_value = 1.0
+        self.progress_fill.setGeometry(0, 0, self.progress_track.width(), 3)
+        QTimer.singleShot(180, self._finish)
+
+    def _finish(self):
         if self.main_window:
             self.main_window.on_boot_finished() 
 
@@ -566,55 +629,112 @@ class MainWindow(QMainWindow):
         self.launcher_page.show()
         self.stacked_widget.setCurrentIndex(self.stacked_widget.indexOf(self.launcher_page))
         if animate:
-            # волна иконок при возврате из приложения — как в OxygenOS
+            # волна иконок — только при разблокировке; при простом показе
+            # лаунчер остаётся в покое (иконки уже на своих местах)
             self.launcher_page.prepare_for_animation()
         self.status_bar_widget.set_is_light_background(False)
         self.setFocusProxy(self.launcher_page)
         self.last_unlocked_page = self.launcher_page
 
-    def _play_closing_morph(self, app_page):
-        """iOS-style dismiss: окно приложения сворачивается в иконку на доке/сетке."""
-        icon = None
+    def _app_page_for_icon(self, ic):
+        """Сопоставление app_id иконки лаунчера со страницей. Возвращает
+        (page, created_placeholder). Для заглушек страница создаётся лениво,
+        чтобы dismiss-морф работал и для неприкрученных приложений."""
+        mapping = {
+            "Phone": getattr(self, "app1_page", None),
+            "Messages": getattr(self, "app2_page", None),
+            "Camera": getattr(self, "camera_page", None),
+            "Calculator": getattr(self, "calculator_page", None),
+            "Browser": getattr(self, "browser_page", None),
+            "Settings": getattr(self, "settings_page", None),
+            "Photos": getattr(self, "app1_page", None),
+            "Store": getattr(self, "app2_page", None),
+        }
+        page = mapping.get(ic.app_id)
+        if page is not None:
+            return page, False
+        # Заглушка: ищем уже созданную temp-страницу или создаём новую
+        for w in self.stacked_widget.findChildren(QWidget):
+            if w.property("hixos_placeholder_app") == ic.app_id:
+                return w, False
+        temp = QWidget()
+        temp.setProperty("hixos_placeholder_app", ic.app_id)
+        temp.setStyleSheet("background-color: #1c1e24; color: white;")
+        lay = QVBoxLayout(temp)
+        lay.setAlignment(Qt.AlignCenter)
+        label = QLabel(f"«{ic.app_id}»\nПриложение ещё не установлено")
+        label.setAlignment(Qt.AlignCenter)
+        label.setStyleSheet("color: rgba(255,255,255,0.75); font-size: 15px;")
+        lay.addWidget(label)
+        btn = QPushButton("Домой")
+        btn.setCursor(Qt.PointingHandCursor)
+        btn.setStyleSheet(
+            "QPushButton{background-color:#007AFF;color:white;border:none;"
+            "border-radius:10px;padding:10px 26px;font-weight:600;}"
+            "QPushButton:pressed{background-color:#0062cc;}")
+        btn.clicked.connect(lambda: self.show_launcher_page(self.current_language))
+        blay = QHBoxLayout()
+        blay.addStretch(1); blay.addWidget(btn); blay.addStretch(1)
+        lay.addLayout(blay)
+        self.stacked_widget.addWidget(temp)
+        return temp, True
+
+    def _find_icon_for_page(self, app_page):
         for ic in self.launcher_page.grid_app_icons + self.launcher_page.dock_app_icons:
-            page_for_id = {
-                "Phone": self.app1_page, "Messages": self.app2_page, "Camera": self.camera_page,
-                "Calculator": self.calculator_page, "Browser": self.browser_page,
-                "Settings": self.settings_page,
-            }.get(ic.app_id)
-            if page_for_id is app_page:
-                icon = ic
-                break
+            page, _ = self._app_page_for_icon(ic)
+            if page is app_page:
+                return ic
+        return None
+
+    def _reveal_launcher_after_dismiss(self):
+        self._closing_morph = None
+        self.launcher_page.show()
+        self.stacked_widget.setCurrentIndex(self.stacked_widget.indexOf(self.launcher_page))
+        self.status_bar_widget.set_is_light_background(False)
+        self.setFocusProxy(self.launcher_page)
+        self.last_unlocked_page = self.launcher_page
+
+    def _play_closing_morph(self, app_page):
+        """iOS-style dismiss: окно приложения плавно сворачивается В СВОЮ ИКОНКУ,
+        лаунчер всё время анимации виден под сворачивающимся окном."""
+        icon = self._find_icon_for_page(app_page)
         if icon is None:
-            # нет подходящей иконки — простой fade-scale выход страницы
+            # нет иконки — backward swipe без волны иконок
+            self.launcher_page.show()
             self.page_swipe.transition_to(self.launcher_page, direction="backward",
                                           duration=Duration.TRANSITION,
-                                          on_finished=lambda: self.launcher_page.animate_icons_in())
-            self.launcher_page.show()
-            self.status_bar_widget.set_is_light_background(False)
-            self.setFocusProxy(self.launcher_page)
-            self.last_unlocked_page = self.launcher_page
+                                          on_finished=self._reveal_launcher_after_dismiss)
             return
 
-        global_tl = icon.mapToGlobal(icon.rect().topLeft())
-        icon_rect = QRect(global_tl, icon.rect().size())
+        # Лаунчер показываем СРАЗУ — он виден под уезжающим окном приложения
+        self.launcher_page.show()
+        self.stacked_widget.setCurrentIndex(self.stacked_widget.indexOf(self.launcher_page))
+
+        # Кадрируем окно приложения в pixmap поверх его фоновой подложки
+        shot = app_page.grab()
+        tl = app_page.mapTo(self, QPoint(0, 0))
+        start_rect = QRect(tl, app_page.size())
+
         root = self
-        target_rect = QRect(root.rect().topLeft(), root.size())
-        morph = MorphOverlay(root, icon_rect, target_rect,
-                             pixmap=icon._original_pixmap, corner_start=0, corner_end=22)
+        # Локальные координаты корня окна: иконка и кадр приложения
+        g_tl = icon.mapToGlobal(icon.rect().topLeft())
+        start_icon_rect = QRect(root.mapFromGlobal(g_tl), icon.rect().size())
+
+        morph = MorphOverlay(root, start_icon_rect, start_rect,
+                             snapshot=shot, corner_start=22, corner_end=0,
+                             rects_local=True)
+        morph.set_progress(1.0)  # старт с полного экрана
+        morph.raise_()
         self._closing_morph = morph
 
-        # саму страницу скрываем сразу под оверлеем — морф дорисует иллюзию
+        # прячем реальное окно сразу — морф-оверлей дорисовывает тот же кадр
         app_page.hide()
 
         def done():
-            self._closing_morph = None
-            self.launcher_page.show()
-            self.stacked_widget.setCurrentIndex(self.stacked_widget.indexOf(self.launcher_page))
-            self.launcher_page.prepare_for_animation()
-            self.status_bar_widget.set_is_light_background(False)
-            self.setFocusProxy(self.launcher_page)
-            self.last_unlocked_page = self.launcher_page
+            self._reveal_launcher_after_dismiss()
 
+        # run_close идёт от прогресса 1->0, но у нас семантика та же:
+        # экран -> иконка. Углы: 0 (экран) -> 22 (иконка) уже в параметрах.
         morph.run_close(duration=Duration.DISMISS, curve=Easing.STANDARD, on_finished=done)
 
 
@@ -648,20 +768,41 @@ class MainWindow(QMainWindow):
             target_page = self.settings_page
             is_light_bg = False
         else:
-            print(f"Error: Unknown application '{app_id}'. Creating temporary placeholder.")
-            temp_app_page = QWidget()
-            temp_app_page.setStyleSheet("background-color: #333; color: white;")
-            temp_layout = QVBoxLayout(temp_app_page)
-            temp_layout.setAlignment(Qt.AlignCenter)
-            temp_layout.addWidget(QLabel(f"Application '{app_id}' not implemented."))
-            
-            close_button = QPushButton("Close Application")
-            close_button.setStyleSheet("background-color: #007AFF; color: white; border-radius: 8px; padding: 10px 20px;")
-            close_button.clicked.connect(lambda: self.show_launcher_page(self.current_language))
-            temp_layout.addWidget(close_button)
+            # Заглушка: переиспользуем/создаём temp-страницу, чтобы при выходе
+            # из неё морф-dismiss тоже работал (раньше каждый запуск создавал
+            # новую страницу и обратный переход падал).
+            icon = None
+            for ic in self.launcher_page.grid_app_icons + self.launcher_page.dock_app_icons:
+                if ic.app_id == app_id:
+                    icon = ic
+                    break
+            if icon is not None:
+                target_page, _ = self._app_page_for_icon(icon)
+            else:
+                print(f"Error: Unknown application '{app_id}'. Creating temporary placeholder.")
+                temp_app_page = QWidget()
+                temp_app_page.setProperty("hixos_placeholder_app", app_id)
+                temp_app_page.setStyleSheet("background-color: #1c1e24; color: white;")
+                temp_layout = QVBoxLayout(temp_app_page)
+                temp_layout.setAlignment(Qt.AlignCenter)
+                lbl = QLabel(f"Приложение «{app_id}» ещё не установлено")
+                lbl.setAlignment(Qt.AlignCenter)
+                lbl.setStyleSheet("color: rgba(255,255,255,0.75); font-size: 15px;")
+                temp_layout.addWidget(lbl)
 
-            self.stacked_widget.addWidget(temp_app_page)
-            target_page = temp_app_page
+                close_button = QPushButton("Домой")
+                close_button.setCursor(Qt.PointingHandCursor)
+                close_button.setStyleSheet(
+                    "QPushButton{background-color:#007AFF;color:white;border:none;"
+                    "border-radius:10px;padding:10px 26px;font-weight:600;}"
+                    "QPushButton:pressed{background-color:#0062cc;}")
+                close_button.clicked.connect(lambda: self.show_launcher_page(self.current_language))
+                blay = QHBoxLayout()
+                blay.addStretch(1); blay.addWidget(close_button); blay.addStretch(1)
+                temp_layout.addLayout(blay)
+
+                self.stacked_widget.addWidget(temp_app_page)
+                target_page = temp_app_page
             is_light_bg = False
 
         if target_page:

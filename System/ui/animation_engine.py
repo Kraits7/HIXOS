@@ -154,32 +154,48 @@ class _FrameDriver(QObject):
 class MorphOverlay(QWidget):
     """iOS/OxygenOS-style morph-переход: иконка разворачивается в окно приложения.
 
-    Рисует скруглённый прямоугольник с pixmap'ом иконки поверх всего,
-    интерполируя геометрию от rect иконки до rect контейнера + радиус
-    скругления (squircle -> rounded rect), как zoom transition в iOS.
+    Рисует скруглённый прямоугольник поверх всего, интерполируя геометрию от
+    rect иконки до rect контейнера + радиус скругления (squircle -> rounded
+    rect), как zoom transition в iOS.
+
+    Два режима рисования:
+      * pixmap-режим (открытие): фон squircle + иконка по центру;
+      * snapshot-режим (закрытие): реальный кадр окна приложения, который
+        сворачивается в иконку — под ним во время анимации виден лаунчер.
     """
 
     def __init__(self, container: QWidget, icon_rect: QRect, target_rect: QRect,
-                 pixmap: QPixmap = None, corner_start: int = 22, corner_end: int = 4):
+                 pixmap: QPixmap = None, corner_start: int = 22, corner_end: int = 4,
+                 snapshot: QPixmap = None, rects_local: bool = False):
         super().__init__(container)
         self.setAttribute(Qt.WA_TransparentForMouseEvents)
         self.setAttribute(Qt.WA_NoSystemBackground)
+        try:
+            self.setAttribute(Qt.WA_ForceActiveWindowsPainting, True)
+        except AttributeError:
+            pass
         self.setGeometry(container.rect())
-        self.raise_()
         self._icon_rect = QRect(icon_rect)
         self._target_rect = QRect(target_rect)
-        # Координаты icon_rect — глобальные (mapToGlobal виджета): переводим
-        # их в систему координат контейнера. target_rect может быть как
-        # локальным (container.rect()), так и глобальным (координаты окна) —
-        # если он совпадает с geometry контейнера, берём локальный rect.
-        tl = container.mapFromGlobal(self._icon_rect.topLeft())
-        self._icon_rect.moveTo(tl)
-        if self._target_rect.topLeft() != QPoint(0, 0):
-            t_tl = container.mapFromGlobal(self._target_rect.topLeft())
-            self._target_rect.moveTo(t_tl)
+        if not rects_local:
+            # Координаты icon_rect — глобальные (mapToGlobal виджета): переводим
+            # их в систему координат контейнера. target_rect может быть как
+            # локальным (container.rect()), так и глобальным (координаты окна) —
+            # если он совпадает с geometry контейнера, берём локальный rect.
+            tl = container.mapFromGlobal(self._icon_rect.topLeft())
+            self._icon_rect.moveTo(tl)
+            if self._target_rect.topLeft() != QPoint(0, 0):
+                t_tl = container.mapFromGlobal(self._target_rect.topLeft())
+                self._target_rect.moveTo(t_tl)
+            else:
+                self._target_rect = QRect(container.rect())
         else:
-            self._target_rect = QRect(container.rect())
+            # rects уже в локальной системе координат контейнера;
+            # если target не задан явно — растягиваем на весь контейнер
+            if self._target_rect.isNull():
+                self._target_rect = QRect(container.rect())
         self._pixmap = pixmap
+        self._snapshot = snapshot
         self._corner_start = corner_start
         self._corner_end = corner_end
         self._progress = 0.0
@@ -206,15 +222,24 @@ class MorphOverlay(QWidget):
 
         path = QPainterPath()
         path.addRoundedRect(float(x), float(y), max(w, 1), max(h, 1), float(r), float(r))
-        painter.fillPath(path, QColor(30, 34, 44))
 
-        if self._pixmap and not self._pixmap.isNull():
-            side = min(w, h) * 0.86
-            px = x + (w - side) / 2.0
-            py = y + (h - side) / 2.0
-            scaled = self._pixmap.scaled(int(side), int(side), Qt.KeepAspectRatio,
-                                         Qt.SmoothTransformation)
-            painter.drawPixmap(int(px), int(py), scaled)
+        if self._snapshot and not self._snapshot.isNull():
+            # snapshot-режим: кадр окна сворачивается в иконку
+            painter.setClipPath(path)
+            painter.drawPixmap(int(x), int(y), int(max(w, 1)), int(max(h, 1)),
+                               self._snapshot)
+            painter.setClipping(False)
+            # лёгкая тень вокруг формы для «плавающего» ощущения iOS
+            painter.fillPath(path, QColor(0, 0, 0, 0))
+        else:
+            painter.fillPath(path, QColor(30, 34, 44))
+            if self._pixmap and not self._pixmap.isNull():
+                side = min(w, h) * 0.86
+                px = x + (w - side) / 2.0
+                py = y + (h - side) / 2.0
+                scaled = self._pixmap.scaled(int(side), int(side), Qt.KeepAspectRatio,
+                                             Qt.SmoothTransformation)
+                painter.drawPixmap(int(px), int(py), scaled)
         super().paintEvent(event)
 
     def run_open(self, duration: int = Duration.LAUNCH, curve=None, on_finished=None):
@@ -246,6 +271,14 @@ class MorphOverlay(QWidget):
 
     def _finish(self):
         self.hide()
+        # уведомляем владельца (лаунчер), что морф завершён — иначе
+        # morph_alive остаётся True и следующая анимация не запустится
+        try:
+            owner = self.parent()
+            if owner is not None and getattr(owner, "_morph", None) is self:
+                owner._morph = None
+        except RuntimeError:
+            pass
         self.deleteLater()
         if self._on_done:
             self._on_done()
@@ -514,6 +547,7 @@ class StaggerReveal(QObject):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._drivers = []
+        self._pending = []  # QTimer.singleShot id -> не отменяемы, храним флаги
 
     def run(self, widgets, apply_fn, step_ms: int = Duration.STAGGER_STEP,
             duration: int = Duration.STANDARD, curve=Easing.STANDARD, delay_ms: int = 0):
@@ -525,7 +559,18 @@ class StaggerReveal(QObject):
             QTimer.singleShot(delay_ms + i * step_ms, d.start)
             self._drivers.append(d)
 
+    def stop_all(self):
+        """Отменяет все драйверы и запрещает запуск ещё не стартовавших."""
+        self._cancelled = True
+        for d in self._drivers:
+            try:
+                d.stop()
+            except Exception:
+                pass
+        self._drivers = []
+
     def cancel(self):
+        self._cancelled = False
         for d in self._drivers:
             d.stop()
         self._drivers = []

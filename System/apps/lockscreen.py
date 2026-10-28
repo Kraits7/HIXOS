@@ -1,7 +1,7 @@
 # apps/lockscreen.py
 from PyQt5.QtWidgets import QWidget, QVBoxLayout, QLabel, QPushButton, QGraphicsOpacityEffect, QHBoxLayout, QSpacerItem
 from PyQt5.QtGui import QFont, QColor, QPixmap, QBrush, QPainter, QLinearGradient, QIcon
-from PyQt5.QtCore import Qt, QTimer, QTime, pyqtSignal, QPropertyAnimation, QEasingCurve, QRect, QPoint, QDate
+from PyQt5.QtCore import Qt, QTimer, QTime, pyqtSignal, QPropertyAnimation, QEasingCurve, QRect, QPoint, QSize, QDate
 
 import os
 

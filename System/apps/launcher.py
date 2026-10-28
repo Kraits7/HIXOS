@@ -13,10 +13,12 @@ from PyQt5.QtCore import Qt, pyqtSignal, QObject, QSize, QPoint, QPropertyAnimat
 try:
     from ui.animation_engine import (
         Easing, Duration, animate, _FrameDriver, MorphOverlay, StaggerReveal,
+        fly_in_transform, spring_progress,
     )
 except ImportError:  # запуск лаунчера standalone из папки apps
     from animation_engine import (
         Easing, Duration, animate, _FrameDriver, MorphOverlay, StaggerReveal,
+        fly_in_transform, spring_progress,
     )
 
 
@@ -485,9 +487,15 @@ class LauncherContent(QFrame):
         #    с per-icon opacity во время волны появления.
         if hasattr(self, "_stagger"):
             self._stagger.stop_all()
+        if getattr(self, "_flyin_driver", None) is not None:
+            self._flyin_driver.stop()
+            self._flyin_driver = None
         for icon in self.grid_app_icons + self.dock_app_icons:
             icon._opacity = 1.0
             icon._scale_factor = 1.0
+            base = getattr(icon, "_flyin_base_y", None)
+            if base is not None:
+                icon.move(icon.x(), base)
             icon.update()
         eff = QGraphicsOpacityEffect(self)
         self.setGraphicsEffect(eff)
@@ -548,68 +556,97 @@ class LauncherContent(QFrame):
 
     def animate_icons_in(self):
         """
-        Волновое (staggered) появление иконок в стиле OxygenOS:
-        единый diagonal wave — scale spring + fade с нарастающей задержкой
-        по row+col, никаких последовательных пауз на каждую иконку.
+        Появление иконок в стиле iOS/MIUI: они НЕ «волной» — каждая иконка
+        ПРИЛЕТАЕТ снизу вверх с spring-оседанием (overshoot) и лёгким
+        масштабным pop'ом. Единый frame-драйвер на всю сетку (60 FPS),
+        stagger — маленькая диагональная задержка, чтобы выглядело как
+        «россыпь прилетевших плиток», а не как последовательная волна.
         """
         all_icons = self.grid_app_icons + self.dock_app_icons
 
-        # Сначала убедимся, что все иконки полностью скрыты для начала анимации
+        # Дожидаемся реальной раскладки (grid может быть ещё не отложен)
+        if not all_icons or all(i.height() <= 0 for i in all_icons):
+            QTimer.singleShot(0, self.animate_icons_in)
+            return
+
+        # Сброс: спрятанные, но НЕ уменьшенные в 0 (прилёт делает свой scale)
         for icon in all_icons:
-            icon.reset_animation_state()
+            icon._scale_factor = 1.0
+            icon.opacity = 0.0
+            icon.show()
 
-        if not hasattr(self, "_stagger"):
-            self._stagger = StaggerReveal(self)
-        self._stagger.cancel()  # сбрасываем _cancelled и старые драйверы
+        if not hasattr(self, "_flyin_driver"):
+            self._flyin_driver = None
+        if self._flyin_driver is not None:
+            self._flyin_driver.stop()
+            self._flyin_driver = None
 
+        # Сохраняем целевые позиции (после layout'а) — относительные, т.к.
+        # absolute pos меняется при resize; offset применяем к текущему x/y
+        entries = []
         columns = max(1, self._current_grid_columns)
-        stagger = self._stagger
-
-        def apply_fn(widget, p):
-            # p уже прошёл easing (STANDARD). Лёгкий overshoot масштаба — spring feel.
-            widget.set_scale(0.6 + 0.4 * p)
-            widget.opacity = min(1.0, p * 1.8)
-
-        def schedule(ms, driver):
-            def _try_start():
-                if not getattr(stagger, "_cancelled", False):
-                    driver.start()
-            QTimer.singleShot(ms, _try_start)
-
-        # Диагональная волна: задержка каждой иконки = (row+col)*STEP
-        step = Duration.STAGGER_STEP
-        delay = 40
         for i, icon in enumerate(self.grid_app_icons):
             row, col = divmod(i, columns)
-            d = _FrameDriver(Duration.STANDARD + 80, Easing.STANDARD,
-                             lambda p, w=icon: apply_fn(w, p), parent=stagger)
-            schedule(delay + (row + col) * step, d)
-            stagger._drivers.append(d)
-
-        # Док появляется первым и быстрее (как в OxygenOS/iOS)
+            entries.append((icon, (row + col) * 0.045))
         for j, icon in enumerate(self.dock_app_icons):
-            d = _FrameDriver(Duration.SHORT + 120, Easing.SPRING,
-                             lambda p, w=icon: apply_fn(w, p), parent=stagger)
-            schedule(20 + j * 30, d)
-            stagger._drivers.append(d)
+            entries.append((icon, 0.02 + j * 0.05))  # док — чуть раньше всех
 
-        # Приветствие — мягкий slide-down + fade
+        total_ms = Duration.STANDARD + 260  # ~580 мс на весь прилёт
+        stagger = self._stagger if hasattr(self, "_stagger") else None
+        if stagger is not None:
+            stagger.stop_all()  # убить остаточные драйверы старых волн
+
         greeting = getattr(self, "greeting_label", None)
+        greet_base_y = greeting.y() if greeting is not None else 0
+
+        def on_frame(p):
+            for icon, off in entries:
+                lp = max(0.0, min(1.0, (p - off) / max(1e-6, 1.0 - off)))
+                dy, scale, opacity = fly_in_transform(lp)
+                icon.set_scale(scale)
+                icon.opacity = opacity
+                # вертикальный полёт относительно базовой позиции
+                base = getattr(icon, "_flyin_base_y", None)
+                if base is None:
+                    base = icon.y()
+                    icon._flyin_base_y = base
+                icon.move(icon.x(), int(base + dy))
+            if greeting is not None:
+                gp = max(0.0, min(1.0, p / 0.55))
+                s = spring_progress(gp)
+                greeting.move(greeting.x(), int(greet_base_y + 18.0 * (1.0 - s)))
+                try:
+                    greeting.windowOpacity  # noqa — эффект ниже через effect
+                except Exception:
+                    pass
+
+        def finish():
+            self._flyin_driver = None
+            for icon, _ in entries:
+                icon.set_scale(1.0)
+                icon.opacity = 1.0
+                base = getattr(icon, "_flyin_base_y", None)
+                if base is not None:
+                    icon.move(icon.x(), base)
+            if greeting is not None:
+                greeting.move(greeting.x(), greet_base_y)
+                greeting.setGraphicsEffect(None)
+
+        # Приветствие — затухание через opacity effect параллельно прилёту
         if greeting is not None:
             from PyQt5.QtWidgets import QGraphicsOpacityEffect as _GOE
             eff = _GOE(greeting)
+            eff.setOpacity(0.0)
             greeting.setGraphicsEffect(eff)
-            base_y = greeting.y()
+            _orig_on_frame = on_frame
 
-            def g_apply(p):
-                eff.setOpacity(min(1.0, p * 1.4))
-                greeting.move(greeting.x(), int(base_y - 14 * (1.0 - p)))
+            def on_frame(p, _eff=eff, _of=_orig_on_frame):
+                _of(p)
+                _eff.setOpacity(min(1.0, p * 2.2))
 
-            gd = _FrameDriver(Duration.STANDARD, Easing.DECELERATE, g_apply,
-                              on_finished=lambda: greeting.setGraphicsEffect(None),
-                              parent=stagger)
-            schedule(0, gd)
-            stagger._drivers.append(gd)
+        self._flyin_driver = _FrameDriver(total_ms, QEasingCurve.Linear,
+                                          on_frame, finish, self)
+        self._flyin_driver.start()
 
     def showEvent(self, event):
         """

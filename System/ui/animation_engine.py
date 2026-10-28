@@ -98,6 +98,36 @@ class Duration:
     STAGGER_STEP = 26  # шаг задержки между иконками в волне появления
 
 
+def spring_progress(p: float, damping: float = 0.78) -> float:
+    """iOS/MIUI-style settle: быстрый вылет + экспоненциальное затухание
+    с лёгким overshoot (~1.05 на середине). p in [0,1] -> ~[0,1]."""
+    import math
+    if p <= 0.0:
+        return 0.0
+    if p >= 1.0:
+        return 1.0
+    return 1.0 - math.exp(-6.0 * p) * math.cos(damping * math.pi * p)
+
+
+def fly_in_transform(local_p: float):
+    """Трансформация «прилёта» иконки (iOS unlock / MIUI launcher appear).
+
+    local_p — локальный прогресс элемента 0..1 (уже со stagger-задержкой).
+    Возвращает (dy_offset_px, scale, opacity): элемент прилетает снизу вверх,
+    слегка перелетает целевую позицию (overshoot) и «оседает», масштаб
+    0.85 -> ~1.03 -> 1.0, прозрачность нарастает быстро.
+    """
+    if local_p <= 0.0:
+        return 46.0, 0.85, 0.0
+    if local_p >= 1.0:
+        return 0.0, 1.0, 1.0
+    s = spring_progress(local_p)
+    dy = 46.0 * (1.0 - s)          # пролетает чуть выше цели и оседает
+    scale = 0.85 + 0.15 * s        # overshoot до ~1.03 за счёт s > 1
+    opacity = min(1.0, local_p * 2.6)
+    return dy, scale, opacity
+
+
 def animate(target: QObject, prop: bytes, start, end,
             duration: int = Duration.STANDARD,
             curve: QEasingCurve = Easing.STANDARD,

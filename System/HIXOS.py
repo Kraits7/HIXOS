@@ -6,14 +6,14 @@ from PyQt5.QtWidgets import (
     QComboBox, QStackedWidget, QFrame, QSizePolicy, QSpacerItem,
     QGraphicsOpacityEffect, QRadioButton, QMessageBox
 )
-from PyQt5.QtGui import QPixmap, QTransform, QColor
-from PyQt5.QtCore import Qt, QTimer, QSize, pyqtSignal, QTime, QPropertyAnimation, QEasingCurve, QRect, QPoint, QParallelAnimationGroup, QEvent, QDate
+from PyQt5.QtGui import QPixmap, QTransform, QColor, QPainter, QPen, QBrush
+from PyQt5.QtCore import Qt, QTimer, QSize, pyqtSignal, QTime, QPropertyAnimation, QEasingCurve, QRect, QRectF, QPoint, QParallelAnimationGroup, QEvent, QDate
 
 # --- Системный движок анимаций (OxygenOS / iOS style) ---
 try:
-    from ui.animation_engine import Easing, Duration, PageSwipe, MorphOverlay
+    from ui.animation_engine import Easing, Duration, PageSwipe, MorphOverlay, _FrameDriver
 except ImportError:
-    from animation_engine import Easing, Duration, PageSwipe, MorphOverlay
+    from animation_engine import Easing, Duration, PageSwipe, MorphOverlay, _FrameDriver
 
 import os
 import json # Import for JSON parsing
@@ -148,14 +148,32 @@ class DummyDataManager:
 
 # Class for the boot screen
 class BootScreenContent(QFrame):
-    """iOS/OxygenOS-style загрузка: логотип по центру (KeepAspectRatio — без
-    растягивания), плавное fade-in пружинкой и тонкий progress-бар внизу."""
+    """Boot-экран в стиле iOS 16: чёрный фон, логотип по центру с плавным
+    fade-in и тонкий кольцевой индикатор загрузки вокруг него.
+
+    Финальный переход к OOBE («добро пожаловать»):
+      1) прогресс дотягивается до 100%;
+      2) логотип плавно исчезает (fade + лёгкое уменьшение);
+      3) полоска загрузки «закручивается» — вытянутая капсула morph'ится
+         в окружность и продолжает вращаться;
+      4) появляется надпись «Добро пожаловать» (spring fade-up);
+      5) оверлей затемняет экран и передаёт управление OOBE — кнопки
+         настройки появляются уже там со своей анимацией."""
+
+    PHASE_IDLE = 0
+    PHASE_LOGO_OUT = 1
+    PHASE_SPIN = 2
+    PHASE_WELCOME = 3
+    PHASE_HANDOFF = 4
+
     def __init__(self, parent=None, image_path='Boot.png'): 
         super().__init__(parent)
         self.main_window = parent
         self.image_path = image_path
         self.boot_timer = QTimer(self) 
         self._progress_value = 0.0
+        self._phase = self.PHASE_IDLE
+        self._spin_angle = 0.0
         self.init_ui()
 
     def _find_image(self):
@@ -190,7 +208,7 @@ class BootScreenContent(QFrame):
             self._pixmap = QPixmap()
         if not self._pixmap.isNull():
             self.image_label.setPixmap(self._pixmap.scaled(
-                240, 240, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+                220, 220, Qt.KeepAspectRatio, Qt.SmoothTransformation))
         else:
             self.image_label.setText("HIX OS")
             self.image_label.setStyleSheet("color: white; font-size: 34px; font-weight: 700;")
@@ -206,6 +224,33 @@ class BootScreenContent(QFrame):
         bottom.setContentsMargins(90, 0, 90, 60)
         bottom.addWidget(self.progress_track)
         self.layout.addLayout(bottom)
+
+        # --- Оверлей перехода к OOBE (рисуется вручную в paintEvent) ---
+        self.welcome_label = QLabel("Добро пожаловать", self)
+        self.welcome_label.setAlignment(Qt.AlignCenter)
+        self.welcome_label.setStyleSheet(
+            "color: white; font-size: 40px; font-weight: 800; letter-spacing: -1px;"
+            "font-family: 'SF Pro Display', 'Segoe UI', 'Roboto', sans-serif;"
+            "background: transparent;")
+        self.welcome_label.setGeometry(0, int(self.height() * 0.30), self.width(), 60)
+        wl_eff = QGraphicsOpacityEffect(self.welcome_label)
+        wl_eff.setOpacity(0.0)
+        self.welcome_label.setGraphicsEffect(wl_eff)
+        self._welcome_eff = wl_eff
+        self.welcome_label.hide()
+
+        # Вторичный индикатор — маленькое кольцо под текстом «Добро пожаловать»
+        self.sub_indicator = QFrame(self)
+        self.sub_indicator.setFixedSize(26, 26)
+        self._sub_angle = 0.0
+        si_eff = QGraphicsOpacityEffect(self.sub_indicator)
+        si_eff.setOpacity(0.0)
+        self.sub_indicator.setGraphicsEffect(si_eff)
+        self._sub_eff = si_eff
+        self.sub_indicator.hide()
+
+        self._overlay_opacity = 0.0     # opacity тёмного оверлея перехода
+        self._morph_t = 0.0             # 0 = полоска, 1 = кольцо
 
         # Fade-in логотипа (spring feel через OUT_BACK)
         self._fade_eff = QGraphicsOpacityEffect(self.image_label)
@@ -235,18 +280,177 @@ class BootScreenContent(QFrame):
         super().resizeEvent(event)
         w = int(self.progress_track.width() * self._progress_value)
         self.progress_fill.setGeometry(0, 0, max(0, w), 3)
+        self.welcome_label.setGeometry(0, int(self.height() * 0.30), self.width(), 60)
 
+    # ------------------------------------------------------------------
+    # Переход Boot -> OOBE
+    # ------------------------------------------------------------------
     def start_initial_setup(self):
         print("Boot screen finished. Transitioning to initial setup...")
         # Дотягиваем прогресс до конца и короткой паузой даём дорисоваться
         self._progress_timer.stop()
         self._progress_value = 1.0
         self.progress_fill.setGeometry(0, 0, self.progress_track.width(), 3)
-        QTimer.singleShot(180, self._finish)
+        QTimer.singleShot(260, self._begin_transition)
 
-    def _finish(self):
-        if self.main_window:
-            self.main_window.on_boot_finished() 
+    def _begin_transition(self):
+        """Фаза 1: логотип исчезает (fade + мягкое уменьшение)."""
+        if self._phase != self.PHASE_IDLE:
+            return
+        self._phase = self.PHASE_LOGO_OUT
+
+        # Прячем обычный progress-бар — его роль перехватит морф-оверлей
+        self.progress_track.hide()
+
+        logo_base_size = self.image_label.size()
+        logo_base_pos = self.image_label.pos()
+
+        def logo_frame(p):
+            self._fade_eff.setOpacity(1.0 - p)
+            s = 1.0 - 0.12 * p
+            w = max(1, int(logo_base_size.width() * s))
+            h = max(1, int(logo_base_size.height() * s))
+            self.image_label.setGeometry(
+                logo_base_pos.x() + (logo_base_size.width() - w) // 2,
+                logo_base_pos.y() + (logo_base_size.height() - h) // 2, w, h)
+
+        def logo_done():
+            self.image_label.hide()
+            self._start_strip_morph()
+
+        self._logo_out_driver = _FrameDriver(
+            420, Easing.ACCELERATE, logo_frame, logo_done, parent=self)
+        self._logo_out_driver.start()
+
+    def _start_strip_morph(self):
+        """Фаза 2: полоска загрузки закручивается в кольцо и вращается."""
+        self._phase = self.PHASE_SPIN
+        self.raise_()
+
+        def morph_frame(p):
+            self._morph_t = p
+
+        def morph_done():
+            self._show_welcome_text()
+
+        self._morph_driver = _FrameDriver(
+            560, Easing.STANDARD, morph_frame, morph_done, parent=self)
+        self._morph_driver.start()
+
+        # Непрерывное вращение индикатора всё время морфа и после него
+        self._spin_timer = QTimer(self)
+        self._spin_timer.timeout.connect(self._tick_spin)
+        self._spin_timer.start(16)
+
+    def _tick_spin(self):
+        self._spin_angle = (self._spin_angle + 9.0) % 360.0
+        self.update()
+
+    def _show_welcome_text(self):
+        """Фаза 3: надпись «Добро пожаловать» выплывает с spring-подъёмом."""
+        self._phase = self.PHASE_WELCOME
+        self.welcome_label.show()
+        base_y = self.welcome_label.y()
+
+        def frame(p):
+            s = spring_progress(p)
+            self._welcome_eff.setOpacity(min(1.0, p * 2.4))
+            self.welcome_label.move(self.welcome_label.x(), int(base_y + 26.0 * (1.0 - s)))
+
+        def done():
+            self.welcome_label.move(self.welcome_label.x(), base_y)
+
+        self._welcome_driver = _FrameDriver(
+            620, QEasingCurve.Linear, frame, done, parent=self)
+        self._welcome_driver.start()
+
+        self.boot_timer.singleShot(1500, self._handoff_to_oobe)
+
+    def _handoff_to_oobe(self):
+        """Фаза 4: затемнение оверлеем и переключение на OOBE.
+        Кнопки и карточки настроек появляются уже внутри OOBE со своей
+        stagger-анимацией (reveal_widgets)."""
+        if self._phase != self.PHASE_WELCOME:
+            return
+        self._phase = self.PHASE_HANDOFF
+
+        def fade_frame(p):
+            self._overlay_opacity = p
+
+        def fade_done():
+            if self._spin_timer:
+                self._spin_timer.stop()
+            if self.main_window:
+                self.main_window.on_boot_finished()
+
+        self._handoff_driver = _FrameDriver(
+            420, Easing.STANDARD, fade_frame, fade_done, parent=self)
+        self._handoff_driver.start()
+
+    # ------------------------------------------------------------------
+    # Отрисовка морфа «полоска -> кольцо» и вращающегося индикатора
+    # ------------------------------------------------------------------
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if self._phase == self.PHASE_IDLE:
+            return
+
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+
+        cx = self.width() / 2.0
+        track_w = float(max(1, self.width() - 180))
+
+        # Тёмный оверлей поверх всего (кроме текста) при передаче экрана OOBE
+        def paint_overlay():
+            if self._overlay_opacity > 0.0:
+                painter.fillRect(self.rect(), QColor(0, 0, 0, int(255 * self._overlay_opacity)))
+
+        if self._phase == self.PHASE_LOGO_OUT:
+            # Логотип ещё исчезает — индикатор не рисуем
+            painter.end()
+            return
+
+        if self._phase == self.PHASE_HANDOFF:
+            # Финальное затемнение к OOBE: spinner уже убран, только fade
+            paint_overlay()
+            painter.end()
+            return
+
+        t = self._morph_t
+        # Морф «полоска -> кольцо»: ширина капсулы схлопывается в диаметр кольца,
+        # высота 3px раздувается до того же диаметра, центр поднимается к середине.
+        diameter = track_w * (1.0 - t) + 72.0 * t
+        height = 3.0 * (1.0 - t) + diameter * t
+        bottom_y = self.height() - 61.5
+        center_y = bottom_y * (1.0 - t) + (self.height() * 0.40) * t
+        radius_x = diameter / 2.0
+        radius_y = height / 2.0
+
+        # Дорожка (трек) — проявляется вместе с закручиванием
+        if t > 0.02:
+            pen_track = QPen(QColor(255, 255, 255, int(36 * t) + 10))
+            pen_track.setWidthF(3.0)
+            pen_track.setCapStyle(Qt.RoundCap)
+            painter.setPen(pen_track)
+            span_track = int(360 * 16 * min(1.0, t))
+            painter.drawArc(QRectF(cx - radius_x, center_y - radius_y,
+                                   diameter, height), 90 * 16, -span_track)
+
+        # Вращающаяся дуга-индикатор (iOS spinner): в начале это короткая
+        # «полоска», бегущая вдоль трека; к концу — треть окружности.
+        arc_len = 90.0 + 130.0 * t
+        start_angle = int((self._spin_angle - arc_len / 2.0) * 16)
+        pen = QPen(QColor(255, 255, 255, 235))
+        pen.setWidthF(3.0)
+        pen.setCapStyle(Qt.RoundCap)
+        painter.setPen(pen)
+        painter.drawArc(QRectF(cx - radius_x + 1.5, center_y - radius_y + 1.5,
+                               max(1.0, diameter - 3.0), max(1.0, height - 3.0)),
+                        start_angle, int(arc_len * 16))
+
+        paint_overlay()
+        painter.end()
 
 # Example App 1
 class App1Content(QFrame):

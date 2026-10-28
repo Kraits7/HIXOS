@@ -673,6 +673,11 @@ class MainWindow(QMainWindow):
             # Reconnect signals after navigation_bar initialization
             self.settings_page.navigation_mode_changed.connect(self.navigation_bar.set_navigation_mode)
             self.navigation_bar.home_button_pressed.connect(lambda: self.show_launcher_page(self.current_language))
+            self.navigation_bar.back_button_pressed.connect(self._on_nav_back)
+            self.navigation_bar.recent_button_pressed.connect(self._on_nav_recents)
+            # Панель наследует чернила от статус-бара (стекло iOS)
+            self.navigation_bar.set_is_light_background(
+                getattr(self.status_bar_widget, "is_light_background", False))
             print("NavigationBarWidget initialized and added.")
         
         self.update_status_bar_theme(self.stacked_widget.currentIndex())
@@ -742,7 +747,7 @@ class MainWindow(QMainWindow):
     def show_lock_screen_page(self):
         self.power_state = self.LOCKED
         self.stacked_widget.setCurrentIndex(self.stacked_widget.indexOf(self.lock_screen_page))
-        self.status_bar_widget.set_is_light_background(False) 
+        self._set_bars_ink(False)
         self.setFocusProxy(self.lock_screen_page)
 
 
@@ -807,7 +812,7 @@ class MainWindow(QMainWindow):
     def show_setup_page(self):
         self.power_state = self.UNLOCKED 
         self.stacked_widget.setCurrentIndex(self.stacked_widget.indexOf(self.setup_page))
-        self.status_bar_widget.set_is_light_background(True)
+        self._set_bars_ink(True)
         self.setFocusProxy(self.setup_page)
         self.setWindowFlags(self.windowFlags() & ~Qt.FramelessWindowHint & ~Qt.WindowStaysOnTopHint)
         self.show()
@@ -845,7 +850,7 @@ class MainWindow(QMainWindow):
             # волна иконок — только при разблокировке; при простом показе
             # лаунчер остаётся в покое (иконки уже на своих местах)
             self.launcher_page.prepare_for_animation()
-        self.status_bar_widget.set_is_light_background(False)
+        self._set_bars_ink(False)
         self.setFocusProxy(self.launcher_page)
         self.last_unlocked_page = self.launcher_page
 
@@ -903,7 +908,7 @@ class MainWindow(QMainWindow):
         self._closing_morph = None
         self.launcher_page.show()
         self.stacked_widget.setCurrentIndex(self.stacked_widget.indexOf(self.launcher_page))
-        self.status_bar_widget.set_is_light_background(False)
+        self._set_bars_ink(False)
         self.setFocusProxy(self.launcher_page)
         self.last_unlocked_page = self.launcher_page
 
@@ -1040,7 +1045,7 @@ class MainWindow(QMainWindow):
                 pt = PageTransition(self.stacked_widget)
                 pt.fade_scale_in(target_page, start_scale=0.96, duration=Duration.TRANSITION)
 
-            self.status_bar_widget.set_is_light_background(is_light_bg)
+            self._set_bars_ink(is_light_bg)
             self.setFocusProxy(target_page) 
             self.last_unlocked_page = target_page 
         else:
@@ -1081,30 +1086,20 @@ class MainWindow(QMainWindow):
                                 f"HIXOS updated to version {new_version}. Please restart the application manually to apply changes.")
         self.close() # Close the application
 
+    def _set_bars_ink(self, is_light_bg: bool):
+        """Единый источник истины: статус-бар и панель навигации красятся
+        одинаково (iOS glass — тёмные чернила на светлом фоне, белые на тёмном)."""
+        if getattr(self, "status_bar_widget", None):
+            self.status_bar_widget.set_is_light_background(is_light_bg)
+        if getattr(self, "navigation_bar", None):
+            self.navigation_bar.set_is_light_background(is_light_bg)
+
     def update_status_bar_theme(self, index):
-        if self.status_bar_widget: 
-            if index == self.stacked_widget.indexOf(self.boot_page):
-                self.status_bar_widget.set_is_light_background(False)
-            elif index == self.stacked_widget.indexOf(self.lock_screen_page): 
-                self.status_bar_widget.set_is_light_background(False)
-            elif index == self.stacked_widget.indexOf(self.setup_page):
-                self.status_bar_widget.set_is_light_background(True)
-            elif index == self.stacked_widget.indexOf(self.launcher_page):
-                self.status_bar_widget.set_is_light_background(False)
-            elif index == self.stacked_widget.indexOf(self.settings_page):
-                self.status_bar_widget.set_is_light_background(False)
-            elif index == self.stacked_widget.indexOf(self.app1_page):
-                self.status_bar_widget.set_is_light_background(False)
-            elif index == self.stacked_widget.indexOf(self.app2_page):
-                self.status_bar_widget.set_is_light_background(False)
-            elif index == self.stacked_widget.indexOf(self.camera_page):
-                self.status_bar_widget.set_is_light_background(False)
-            elif index == self.stacked_widget.indexOf(self.calculator_page):
-                self.status_bar_widget.set_is_light_background(False)
-            elif index == self.stacked_widget.indexOf(self.browser_page): 
-                self.status_bar_widget.set_is_light_background(True) # Browser will have a light background
-            else:
-                self.status_bar_widget.set_is_light_background(False)
+        # Карта «светлый фон страницы» для системных баров (статус + навигация)
+        sw = self.stacked_widget
+        light_pages = {sw.indexOf(self.setup_page), sw.indexOf(self.browser_page)}
+        is_light = index in light_pages
+        self._set_bars_ink(is_light)
 
     # --- НОВЫЕ МЕТОДЫ: Обработчики для настроек лаунчера ---
     def on_launcher_icon_size_changed(self, size: int):

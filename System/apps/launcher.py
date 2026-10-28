@@ -588,15 +588,17 @@ class LauncherContent(QFrame):
 
     def animate_icons_in(self, origin=None):
         """
-        Появление иконок в стиле iOS/MIUI: они НЕ «волной» — каждая иконка
-        ПРИЛЕТАЕТ снизу вверх с spring-оседанием (overshoot) и лёгким
-        масштабным pop'ом. Единый frame-драйвер на всю сетку (60 FPS),
-        stagger — маленькая диагональная задержка, чтобы выглядело как
-        «россыпь прилетевших плиток», а не как последовательная волна.
+        Прилёт иконок КАК РАЗБЛОКИРОВКА В iOS: НИКАКОЙ волны и никаких
+        диагональных россыпей по расстоянию от точки. Весь рабочий стол
+        (сетка + док + приветствие) прилетает ОДНОЙ группой:
+          • стартовое состояние — увеличенные (~1.08) и полностью
+            прозрачные плитки (как домашний экран под уезжающим локскрином);
+          • они оседают вниз в свою позицию с ease-out и проявляются;
+          • лёгкий spring-отскок в конце — «приземление».
+        duration ~450 мс — ровно как unlock transition в iOS.
 
-        origin (QPointF|None): если задан — задержка каждой иконки считается
-        по расстоянию от этой точки (волна расходится ОТ неё), например от
-        кнопки «Начать работу» в конце OOBE.
+        Параметр origin оставлен только для совместимости со старыми
+        вызовами (OOBE) и больше НЕ создаёт волну.
         """
         all_icons = self.grid_app_icons + self.dock_app_icons
 
@@ -605,80 +607,62 @@ class LauncherContent(QFrame):
             QTimer.singleShot(0, lambda: self.animate_icons_in(origin))
             return
 
-        # Сброс: спрятанные, но НЕ уменьшенные в 0 (прилёт делает свой scale)
-        for icon in all_icons:
-            icon._scale_factor = 1.0
-            icon.opacity = 0.0
-            icon.show()
-
-        if not hasattr(self, "_flyin_driver"):
-            self._flyin_driver = None
-        if self._flyin_driver is not None:
+        # Никаких остаточных драйверов старых волн
+        stagger = self._stagger if hasattr(self, "_stagger") else None
+        if stagger is not None:
+            stagger.stop_all()
+        if getattr(self, "_flyin_driver", None) is not None:
             self._flyin_driver.stop()
             self._flyin_driver = None
 
-        # Сохраняем целевые позиции (после layout'а) — относительные, т.к.
-        # absolute pos меняется при resize; offset применяем к текущему x/y
+        # Базовые позиции (до layout-сдвигов) + стартовое состояние iOS-unlock
         entries = []
-        columns = max(1, self._current_grid_columns)
-        for i, icon in enumerate(self.grid_app_icons):
-            row, col = divmod(i, columns)
-            entries.append((icon, (row + col) * 0.045))
-        for j, icon in enumerate(self.dock_app_icons):
-            entries.append((icon, 0.02 + j * 0.05))  # док — чуть раньше всех
-
-        total_ms = Duration.STANDARD + 260  # ~580 мс на весь прилёт
-        stagger = self._stagger if hasattr(self, "_stagger") else None
-        if stagger is not None:
-            stagger.stop_all()  # убить остаточные драйверы старых волн
+        for icon in all_icons:
+            base = getattr(icon, "_flyin_base_y", None)
+            if base is None:
+                base = icon.y()
+                icon._flyin_base_y = base
+            icon.opacity = 0.0
+            icon.set_scale(1.08)   # iOS: иконки под локскрином чуть увеличены
+            icon.show()
+            entries.append((icon, base))
 
         greeting = getattr(self, "greeting_label", None)
         greet_base_y = greeting.y() if greeting is not None else 0
+        greet_eff = None
+        if greeting is not None:
+            greet_eff = QGraphicsOpacityEffect(greeting)
+            greet_eff.setOpacity(0.0)
+            greeting.setGraphicsEffect(greet_eff)
+
+        total_ms = 450  # длительность unlock-перехода iOS
 
         def on_frame(p):
-            for icon, off in entries:
-                lp = max(0.0, min(1.0, (p - off) / max(1e-6, 1.0 - off)))
-                dy, scale, opacity = fly_in_transform(lp)
+            # easing применяем один раз ко ВСЕЙ группе — синхронный прилёт
+            e = Easing.IOS_TRANSITION.getPoint(p)
+            dy = 26.0 * (1.0 - e)              # прилёт сверху вниз в позицию
+            scale = 1.08 - 0.08 * e            # оседание 1.08 -> 1.0
+            op = min(1.0, p * 3.0)             # быстрое проявление
+            for icon, base in entries:
                 icon.set_scale(scale)
-                icon.opacity = opacity
-                # вертикальный полёт относительно базовой позиции
-                base = getattr(icon, "_flyin_base_y", None)
-                if base is None:
-                    base = icon.y()
-                    icon._flyin_base_y = base
+                icon.opacity = op
                 icon.move(icon.x(), int(base + dy))
             if greeting is not None:
-                gp = max(0.0, min(1.0, p / 0.55))
-                s = spring_progress(gp)
-                greeting.move(greeting.x(), int(greet_base_y + 18.0 * (1.0 - s)))
-                try:
-                    greeting.windowOpacity  # noqa — эффект ниже через effect
-                except Exception:
-                    pass
+                gp = max(0.0, min(1.0, p / 0.7))
+                gs = spring_progress(gp)
+                greeting.move(greeting.x(), int(greet_base_y + 14.0 * (1.0 - gs)))
+                if greet_eff is not None:
+                    greet_eff.setOpacity(min(1.0, p * 2.4))
 
         def finish():
             self._flyin_driver = None
-            for icon, _ in entries:
+            for icon, base in entries:
                 icon.set_scale(1.0)
                 icon.opacity = 1.0
-                base = getattr(icon, "_flyin_base_y", None)
-                if base is not None:
-                    icon.move(icon.x(), base)
+                icon.move(icon.x(), base)
             if greeting is not None:
                 greeting.move(greeting.x(), greet_base_y)
                 greeting.setGraphicsEffect(None)
-
-        # Приветствие — затухание через opacity effect параллельно прилёту
-        if greeting is not None:
-            from PyQt5.QtWidgets import QGraphicsOpacityEffect as _GOE
-            eff = _GOE(greeting)
-            eff.setOpacity(0.0)
-            greeting.setGraphicsEffect(eff)
-            _orig_on_frame = on_frame
-
-            def on_frame(p, _eff=eff, _of=_orig_on_frame):
-                _of(p)
-                _eff.setOpacity(min(1.0, p * 2.2))
 
         self._flyin_driver = _FrameDriver(total_ms, QEasingCurve.Linear,
                                           on_frame, finish, self)
@@ -698,11 +682,13 @@ class LauncherContent(QFrame):
         """
         Подготавливает лаунчер к анимации при следующем показе (например, после разблокировки).
         Вызывается извне (например, из MainWindow).
+
+        ВАЖНО: иконки НЕ сбрасываются в scale=0 — состояние «до прилёта»
+        (увеличенные и прозрачные, как в iOS-unlock) выставляет сам
+        animate_icons_in(), поэтому между подготовкой и стартом анимации
+        сетка не мигает нулевыми плитками.
         """
         self._should_animate_on_show = True
-        # Убедимся, что иконки сброшены к начальному состоянию для анимации
-        for icon in self.grid_app_icons + self.dock_app_icons:
-            icon.reset_animation_state()
 
     # Переопределяем paintEvent для рисования фона
     def paintEvent(self, event):

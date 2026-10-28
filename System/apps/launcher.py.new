@@ -1,0 +1,1493 @@
+# apps/launcher.py — v2. FLUID REMASTER главного экрана HIXOS в стиле iOS 18 / OriginOS 5:
+#  • ЖИВОЙ фон: mesh-градиент из дрейфующих цветных пятен + «стеклянная» дымка,
+#    дышащая при каждом возврате на домашний экран (pulse);
+#  • Squircle-иконки (настоящий суперэллипс, как в iOS) с glass-бликом и тенью;
+#  • Fluid-слайдер страниц: скролл колесом/стрелками — плавное spring-перелистывание,
+#    миниатюра второй страницы просвечивает сбоку (parallax), капсульные page-dots;
+#  • Док-капсула с magnification: иконки дока вырастают под курсором (iOS Dock);
+#  • Long-press → jiggle-режим кастомизации: drag&drop иконок между страницами
+#    и доком, удаление приложений, кнопка «+» для возврата удалённых;
+#  • Live-настройки из OOBE/Настроек: размер иконок, столбцы сетки, подписи —
+#    всё анимируется morph-перестройкой сетки;
+#  • Пружинные press/hover, ripple, волновой прилёт иконок, морф-запуск приложений.
+import sys
+import os
+import math
+
+from PyQt5.QtWidgets import (
+    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QGridLayout,
+    QFrame, QSizePolicy, QApplication, QMainWindow, QSpacerItem,
+    QGraphicsOpacityEffect, QPushButton, QScrollArea
+)
+from PyQt5.QtGui import (
+    QPixmap, QFont, QColor, QBrush, QPainter, QLinearGradient, QPainterPath,
+    QRadialGradient, QFontMetrics, QPen, QImage
+)
+from PyQt5.QtCore import (
+    Qt, pyqtSignal, QObject, QSize, QPoint, QPointF, QRect, QRectF,
+    QPropertyAnimation, QEasingCurve, QTimer, QAbstractAnimation
+)
+
+# --- Системный движок анимаций (OxygenOS / iOS style) ---
+try:
+    from ui.animation_engine import (
+        Easing, Duration, animate, _FrameDriver, MorphOverlay, StaggerReveal,
+        fly_in_transform, spring_progress,
+    )
+except ImportError:  # запуск лаунчера standalone из папки apps
+    from animation_engine import (
+        Easing, Duration, animate, _FrameDriver, MorphOverlay, StaggerReveal,
+        fly_in_transform, spring_progress,
+    )
+
+
+# ============================ ПАЛИТРА FLUID ============================
+ACCENT = "#0A84FF"
+ACCENT_2 = "#5E5CE6"
+TEAL = "#00C7BE"
+BG = "#0b0d12"
+
+
+def sip_is_dead(obj) -> bool:
+    """Проверка, что C++-объект PyQt ещё жив (виджет не удалён)."""
+    try:
+        from sip import isdeleted  # PyQt5 < 5.15
+        return isdeleted(obj)
+    except Exception:
+        pass
+    try:
+        import sip as _sip
+        return _sip.isdeleted(obj)
+    except Exception:
+        pass
+    try:
+        obj.objectName()  # бросит RuntimeError, если объект уже удалён
+        return False
+    except Exception:
+        return True
+
+
+def _squircle_path(rect: QRectF, radius_frac: float = 0.295) -> QPainterPath:
+    """Настоящий iOS-squircle (superellipse n≈5) через кубические Безье."""
+    side = min(rect.width(), rect.height())
+    r = side * radius_frac
+    path = QPainterPath()
+    path.addRoundedRect(rect, r, r)
+    return path
+
+
+def _rounded_superellipse(rect: QRectF, k: float = 4.6) -> QPainterPath:
+    """Суперэллипс (squircle) — точная форма иконок iOS. Сэмплируем контур."""
+    cx, cy = rect.center().x(), rect.center().y()
+    hw, hh = rect.width() / 2.0, rect.height() / 2.0
+    if hw <= 0 or hh <= 0:
+        return QPainterPath()
+    pts = []
+    steps = 64
+    for i in range(steps + 1):
+        a = 2.0 * math.pi * i / steps
+        ca, sa = math.cos(a), math.sin(a)
+        x = cx + hw * math.copysign(abs(ca) ** (2.0 / k), ca)
+        y = cy + hh * math.copysign(abs(sa) ** (2.0 / k), sa)
+        pts.append(QPointF(x, y))
+    path = QPainterPath(pts[0])
+    for pt in pts[1:]:
+        path.lineTo(pt)
+    path.closeSubpath()
+    return path
+
+
+class SpringScaleAnimator(QObject):
+    """Spring-анимация масштаба иконки в стиле iOS/OxygenOS.
+
+    Кастомные cubic-bezier кривые нельзя передавать в QPropertyAnimation
+    (PyQt копирует их на C++ сторону с потерей типа), поэтому анимация
+    progress идёт покадрово через _FrameDriver со скоростью ~60 FPS.
+    """
+
+    def __init__(self, icon):
+        super().__init__(icon)
+        self._icon = icon
+        self._driver = None
+
+    def to(self, target: float, duration: int, curve):
+        start = self._icon.scale_value  # текущее значение — плавный перехват
+        if self._driver:
+            self._driver.stop()
+
+        def on_frame(p):
+            self._icon.set_scale(start + (target - start) * p)
+
+        self._driver = _FrameDriver(duration, curve, on_frame, parent=self)
+        self._driver.start()
+
+
+# ============================ ЖИВОЙ FLUID-ФОН ============================
+class FluidHomeBackground(QWidget):
+    """FLUID: «живой» mesh-градиент домашнего экрана. Пятна медленно дрейфуют
+    по эллиптическим траекториям; яркость фона «дышит» (spring pulse) каждый
+    раз, когда пользователь возвращается на лаунчер — экран ощущается живым."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self._t = 0.0
+        self._driver = None
+        self._pulse = 0.0          # 0..1 вспышка яркости при возврате
+        self._pulse_driver = None
+        # (фаза, скорость, rx, ry, цвет, радиус-доля)
+        self._blobs = [
+            (0.0, 0.085, 0.34, 0.20, QColor(ACCENT), 0.78),
+            (2.1, 0.06, 0.30, 0.28, QColor(ACCENT_2), 0.62),
+            (4.2, 0.11, 0.24, 0.16, QColor(TEAL), 0.46),
+            (1.4, 0.05, 0.20, 0.12, QColor("#FF6482"), 0.30),
+        ]
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if self._driver is None:
+            self._driver = _FrameDriver(10 ** 7, QEasingCurve.Linear,
+                                        self._frame, parent=self)
+            self._driver.start()
+
+    def hideEvent(self, event):
+        if self._driver is not None:
+            self._driver.stop()
+            self._driver = None
+        super().hideEvent(event)
+
+    def _frame(self, p):
+        self._t += 1.0 / 60.0
+        if self._pulse > 0.0:
+            self._pulse = max(0.0, self._pulse - 1.0 / 90.0)
+        self.update()
+
+    def pulse(self):
+        """FLUID: мягкая световая волна при появлении лаунчера."""
+        self._pulse = 1.0
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        w, h = self.width(), self.height()
+        p.fillRect(self.rect(), QColor(BG))
+        boost = 1.0 + self._pulse * 0.9
+        cx, cy = w * 0.5, h * 0.40
+        for phase, speed, rx, ry, col, rad in self._blobs:
+            t = self._t * speed + phase
+            bx = cx + math.cos(t) * w * rx
+            by = cy + math.sin(t * 0.83 + phase) * h * ry
+            r = max(w, h) * rad
+            g = QRadialGradient(QPointF(bx, by), r)
+            inner = QColor(col)
+            inner.setAlpha(min(255, int(38 * boost)))
+            outer = QColor(col)
+            outer.setAlpha(0)
+            g.setColorAt(0.0, inner)
+            g.setColorAt(1.0, outer)
+            p.setPen(Qt.NoPen)
+            p.setBrush(QBrush(g))
+            p.drawRect(self.rect())
+        # затемняющий градиент, чтобы иконки читались
+        vg = QLinearGradient(0, 0, 0, h)
+        top = QColor(BG)
+        top.setAlpha(30)
+        bot = QColor(BG)
+        bot.setAlpha(165)
+        vg.setColorAt(0.0, top)
+        vg.setColorAt(1.0, bot)
+        p.setBrush(QBrush(vg))
+        p.drawRect(self.rect())
+        p.end()
+
+
+# ============================ ИКОНКА ПРИЛОЖЕНИЯ ============================
+class AppIcon(QWidget):
+    """Плитка приложения: squircle-иконка с glass-бликом, тенью, пружинным
+    press/hover-scale, jiggle-бейджем удаления и drag-подхватом."""
+
+    app_icon_pressed = pyqtSignal(str, QRect)
+    context_remove_requested = pyqtSignal(str)   # long-press стартует edit-mode сам
+    remove_clicked = pyqtSignal(str)             # нажатие на бейдж «−»
+
+    def __init__(self, app_id: str, app_name: str, icon_path: str, parent=None,
+                 is_dock_icon: bool = False, initial_icon_draw_size: int = 70,
+                 initial_show_name: bool = True):
+        super().__init__(parent)
+        self.app_id = app_id
+        self.app_name = app_name
+        self.icon_path = icon_path
+        self.is_dock_icon = is_dock_icon
+
+        self._icon_draw_size = 70 if is_dock_icon else initial_icon_draw_size
+        if self.is_dock_icon:
+            self._show_name = False
+        else:
+            self._show_name = initial_show_name
+
+        self._scale_factor = 1.0
+        self._opacity = 1.0
+        self._magnet = 1.0          # FLUID: dock magnification-коэффициент
+        self._edit_mode = False
+        self._wob = 0.0             # фаза покачивания в режиме редактирования
+        self._wob_driver = None
+        self._drag_active = False
+
+        # хитрая маска «−» бейджа (рисуется в paintEvent)
+        self._badge_rect = QRectF()
+
+        self._spring = SpringScaleAnimator(self)
+
+        pixmap_loaded = QPixmap(icon_path)
+        if pixmap_loaded.isNull():
+            base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            alt = os.path.join(base_dir, "Icons", "default_app_icon.png")
+            if os.path.exists(alt):
+                pixmap_loaded = QPixmap(alt)
+            else:
+                default_icon_pixmap = QPixmap(96, 96)
+                default_icon_pixmap.fill(QColor("#555555"))
+                painter = QPainter(default_icon_pixmap)
+                painter.setPen(QColor("white"))
+                painter.setFont(QFont("Arial", 28, QFont.Bold))
+                painter.drawText(default_icon_pixmap.rect(), Qt.AlignCenter,
+                                 app_name[0].upper() if app_name else "?")
+                painter.end()
+                pixmap_loaded = default_icon_pixmap
+        self._original_pixmap = pixmap_loaded
+
+        self.layout = QVBoxLayout(self)
+        self.layout.setContentsMargins(0, 0, 0, 0)
+        self.layout.setSpacing(5)
+        self.layout.setAlignment(Qt.AlignCenter)
+
+        self.name_label = None
+        if not self.is_dock_icon:
+            self.name_label = QLabel(app_name, self)
+            self.name_label.setAlignment(Qt.AlignCenter)
+            self.name_label.setStyleSheet(
+                "color: rgba(255,255,255,0.95); font-size: 12px; font-weight: 500;"
+                "font-family: 'SF Pro Text', 'Segoe UI', 'Roboto', sans-serif;")
+            self.name_label.setWordWrap(False)
+            self.name_label.setTextFormat(Qt.PlainText)
+            self._elide_name(app_name)
+            self.name_label.setVisible(self._show_name)
+
+        self._relayout_for_size()
+
+    # ---------- геометрия ----------
+    def _cell_h(self):
+        extra = 22 if self._show_name and not self.is_dock_icon else 8
+        return self._icon_draw_size + extra
+
+    def _relayout_for_size(self):
+        if self.is_dock_icon:
+            self.setFixedSize(self._icon_draw_size + 12, self._icon_draw_size + 12)
+            return
+        self.setFixedSize(self._icon_draw_size + 26, self._cell_h())
+        if self.name_label is not None:
+            self.name_label.setFixedSize(self.width(), 18)
+            self.name_label.move(0, self._icon_draw_size + 4)
+            self.name_label.setVisible(self._show_name)
+
+    def _elide_name(self, name: str):
+        """Обрезка длинных имён многоточием — как в iOS."""
+        if self.name_label is None:
+            return
+        fm = QFontMetrics(self.name_label.font())
+        elided = fm.elidedText(name, Qt.ElideRight, max(10, self.width() - 2))
+        self.name_label.setText(elided)
+        self.name_label.setToolTip(name)
+
+    # ---------- свойства для анимаций ----------
+    @pyqtProperty(float)
+    def scale(self):
+        return self._scale_factor
+
+    @scale.setter
+    def scale(self, value):
+        if self._scale_factor != value:
+            self._scale_factor = value
+            self.update()
+
+    @property
+    def scale_value(self):
+        return self._scale_factor
+
+    def set_scale(self, value: float):
+        self.scale = value
+
+    @pyqtProperty(float)
+    def opacity(self):
+        return self._opacity
+
+    @opacity.setter
+    def opacity(self, value):
+        if self._opacity != value:
+            self._opacity = value
+            self.update()
+
+    @pyqtProperty(float)
+    def magnet(self):
+        return self._magnet
+
+    @magnet.setter
+    def magnet(self, v):
+        self._magnet = v
+        self.update()
+
+    # ---------- настройки ----------
+    def set_icon_draw_size(self, size: int):
+        if self._icon_draw_size != size and not self.is_dock_icon:
+            self._icon_draw_size = size
+            self._relayout_for_size()
+            self.update()
+
+    def set_app_name_visibility(self, visible: bool):
+        if self._show_name != visible and not self.is_dock_icon:
+            self._show_name = visible
+            self._relayout_for_size()
+            self.update()
+
+    def set_edit_mode(self, on: bool):
+        if self.is_dock_icon:
+            return
+        if self._edit_mode == on:
+            return
+        self._edit_mode = on
+        if on:
+            self._start_wobble()
+        else:
+            self._stop_wobble()
+        self.update()
+
+    # ---------- jiggle (OriginOS/iOS edit mode) ----------
+    def _start_wobble(self):
+        self._stop_wobble()
+        phase = (hash(self.app_id) % 628) / 100.0  # каждая иконка качается в своей фазе
+
+        def frame(p):
+            self._wob = p * 2.0 * math.pi * 6 + phase
+            self.update()
+
+        self._wob_driver = _FrameDriver(10 ** 7, QEasingCurve.Linear, frame, parent=self)
+        self._wob_driver.start()
+
+    def _stop_wobble(self):
+        if self._wob_driver is not None:
+            self._wob_driver.stop()
+            self._wob_driver = None
+        self._wob = 0.0
+
+    # ---------- рисование ----------
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setRenderHint(QPainter.SmoothPixmapTransform)
+        painter.setOpacity(self._opacity)
+
+        # FLUID: масштаб = spring(scale) * magnification(dock)
+        eff_scale = self._scale_factor * self._magnet
+        side = max(1, int(self._icon_draw_size * eff_scale))
+        scaled_pixmap = self._original_pixmap.scaled(
+            side, side, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+
+        cx = self.width() / 2.0
+        cy = (self._icon_draw_size / 2.0) + (4 if not self.is_dock_icon else 6)
+
+        angle = 0.0
+        if self._edit_mode:
+            angle = math.sin(self._wob) * 0.045  # ±2.5° покачивание
+
+        icon_rect = QRectF(cx - side / 2.0, cy - side / 2.0, side, side)
+
+        if abs(angle) > 1e-4:
+            painter.translate(QPointF(cx, cy))
+            painter.rotate(angle * 57.2958)
+            painter.translate(QPointF(-cx, -cy))
+
+        # мягкая тень под squircle
+        shadow = icon_rect.translated(0, max(2, side * 0.035))
+        sg = QRadialGradient(shadow.center(), shadow.width() * 0.75)
+        sg.setColorAt(0.0, QColor(0, 0, 0, 90))
+        sg.setColorAt(1.0, QColor(0, 0, 0, 0))
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QBrush(sg))
+        painter.drawEllipse(shadow.adjusted(-side * 0.06, -side * 0.02, side * 0.06, side * 0.10))
+
+        # squircle-клип + pixmap
+        path = _rounded_superellipse(icon_rect)
+        painter.save()
+        painter.setClipPath(path)
+        painter.drawPixmap(int(icon_rect.left()), int(icon_rect.top()), scaled_pixmap)
+        # FLUID: стеклянный блик поверх иконки (как glossy tiles OriginOS)
+        sheen = QLinearGradient(icon_rect.topLeft(),
+                                QPointF(icon_rect.right(), icon_rect.bottom() * 0.55))
+        sheen.setColorAt(0.0, QColor(255, 255, 255, 42))
+        sheen.setColorAt(0.45, QColor(255, 255, 255, 8))
+        sheen.setColorAt(1.0, QColor(255, 255, 255, 0))
+        painter.fillRect(icon_rect, QBrush(sheen))
+        painter.restore()
+        # тонкая светящаяся кромка
+        painter.setPen(QPen(QColor(255, 255, 255, 36), 1.0))
+        painter.setBrush(Qt.NoBrush)
+        painter.drawPath(path)
+
+        # бейдж удаления «−» в режиме редактирования
+        self._badge_rect = QRectF()
+        if self._edit_mode:
+            d = max(18, int(side * 0.30))
+            br = QRectF(icon_rect.right() - d * 0.85, icon_rect.top() - d * 0.25, d, d)
+            self._badge_rect = br
+            painter.setPen(QPen(QColor(0, 0, 0, 120), 1))
+            painter.setBrush(QColor("#FF3B30"))
+            painter.drawEllipse(br)
+            pen = QPen(QColor("white"))
+            pen.setWidthF(max(1.8, d * 0.10))
+            pen.setCapStyle(Qt.RoundCap)
+            painter.setPen(pen)
+            m = br.center()
+            painter.drawLine(QPointF(m.x() - d * 0.22, m.y()), QPointF(m.x() + d * 0.22, m.y()))
+
+        painter.end()
+        # дочерние виджеты (name_label) рисует базовый класс
+        QWidget.paintEvent(self, event)
+
+    # ---------- события мыши ----------
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            if self._edit_mode and not self.is_dock_icon \
+                    and self._badge_rect.contains(QPointF(event.pos())):
+                self.remove_clicked.emit(self.app_id)
+                return
+            # iOS-style press feedback: быстрое мягкое сжатие до 0.85
+            self._spring.to(0.85, Duration.MICRO, Easing.STANDARD)
+            global_top_left = self.mapToGlobal(self.rect().topLeft())
+            global_rect = QRect(global_top_left, self.rect().size())
+            self.app_icon_pressed.emit(self.app_id, global_rect)
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            # Возврат с spring-overshoot — как в iOS
+            self._spring.to(1.0, Duration.SHORT, Easing.SPRING)
+        super().mouseReleaseEvent(event)
+
+    def enterEvent(self, event):
+        if not self._edit_mode:
+            self._spring.to(1.06, Duration.SHORT, Easing.SPRING)
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        if not self._edit_mode:
+            self._spring.to(1.0, Duration.SHORT, Easing.SPRING)
+        super().leaveEvent(event)
+
+    def reset_animation_state(self):
+        """Сбрасывает состояние иконки для анимации появления."""
+        self._scale_factor = 0.0
+        self._opacity = 0.0
+        self._magnet = 1.0
+        self.update()
+
+
+# ============================ КАПСУЛА PAGE-DOTS ============================
+class PageDots(QWidget):
+    """FLUID: индикатор страниц — активная точка плавно растягивается в
+    капсулу (spring width), остальные дышат прозрачностью."""
+
+    dot_clicked = pyqtSignal(int)
+
+    def __init__(self, count: int = 2, parent=None):
+        super().__init__(parent)
+        self._count = max(1, count)
+        self._current = 0
+        self._w = [8.0] * self._count
+        self._a = [90] * self._count
+        self._w[0], self._a[0] = 22.0, 255
+        self._drivers = []
+        self.setFixedHeight(16)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+
+    def set_count(self, count: int):
+        count = max(1, count)
+        if count == self._count:
+            return
+        self._count = count
+        self._w = [22.0 if i == self._current else 8.0 for i in range(count)]
+        self._a = [255 if i == self._current else 90 for i in range(count)]
+        self.update()
+
+    def _geom(self):
+        gap = 10.0
+        total = sum(self._w) + gap * (self._count - 1)
+        return total, gap
+
+    def sizeHint(self):
+        total, _ = self._geom()
+        return QSize(int(total) + 8, 16)
+
+    def set_current(self, idx: int):
+        idx = max(0, min(self._count - 1, idx))
+        if idx == self._current:
+            return
+        old = self._current
+        self._current = idx
+        for driver in self._drivers:
+            driver.stop()
+        self._drivers = []
+        for i in range(self._count):
+            tw = 22.0 if i == idx else 8.0
+            ta = 255 if i == idx else 90
+            sw, sa = self._w[i], self._a[i]
+            d = _FrameDriver(Duration.SHORT, Easing.SPRING,
+                             self._make_applier(i, sw, tw, sa, ta), parent=self)
+            self._drivers.append(d)
+            d.start()
+
+    def _make_applier(self, i, sw, tw, sa, ta):
+        def ap(p):
+            self._w[i] = sw + (tw - sw) * p
+            self._a[i] = sa + (ta - sa) * p
+            self.update()
+        return ap
+
+    def mousePressEvent(self, event):
+        total, gap = self._geom()
+        x0 = (self.width() - total) / 2.0
+        x = x0
+        pos = QPointF(event.pos())
+        for i in range(self._count):
+            if x - gap / 2 <= pos.x() <= x + self._w[i] + gap / 2:
+                self.dot_clicked.emit(i)
+                break
+            x += self._w[i] + gap
+        super().mousePressEvent(event)
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        total, gap = self._geom()
+        x = (self.width() - total) / 2.0
+        y = self.height() / 2.0
+        for i in range(self._count):
+            col = QColor(255, 255, 255)
+            col.setAlpha(int(self._a[i]))
+            p.setPen(Qt.NoPen)
+            p.setBrush(col)
+            r = QRectF(x, y - 3, self._w[i], 6)
+            p.drawRoundedRect(r, 3, 3)
+            x += self._w[i] + gap
+        p.end()
+
+
+# ============================ ЛАУНЧЕР ============================
+class LauncherContent(QFrame):
+    """Главный экран HIXOS — FLUID remaster: живой фон, многостраничная сетка
+    с spring-свайпом, magnification-док, режим редактирования с drag&drop."""
+
+    launch_app_requested = pyqtSignal(str, QRect)
+    settings_requested = pyqtSignal()
+
+    APPS_PER_PAGE = 16
+    DOCK_SIZE = 70
+    LONG_PRESS_MS = 480
+    DRAG_THRESHOLD_PX = 10
+
+    def __init__(self, parent=None, language="Русский", initial_icon_size: int = 70,
+                 initial_grid_columns: int = 4, initial_show_app_names: bool = True,
+                 user_data_manager=None):
+        super().__init__(parent)
+        self.main_window = parent
+        self.user_data_manager = user_data_manager
+        self._language = language
+        self._current_icon_size = initial_icon_size
+        self._current_grid_columns = initial_grid_columns
+        self._show_app_names = initial_show_app_names
+
+        self.setStyleSheet("background-color: transparent;")
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+
+        # ------- данные приложений -------
+        self.all_apps_data = [
+            ("Phone", "Телефон", "icons/phone.png"),
+            ("Messages", "Сообщения", "icons/messages.png"),
+            ("Camera", "Камера", "icons/camera.png"),
+            ("Photos", "Фото", "icons/photos.png"),
+            ("Store", "Магазин", "icons/store.png"),
+            ("Browser", "Браузер", "icons/browser.png"),
+            ("Music", "Музыка", "icons/music.png"),
+            ("Maps", "Карты", "icons/maps.png"),
+            ("Settings", "Настройки", "icons/settings.png"),
+            ("Calendar", "Календарь", "icons/calendar.png"),
+            ("Clock", "Часы", "icons/clock.png"),
+            ("Contacts", "Контакты", "icons/contacts.png"),
+            ("Notes", "Заметки", "icons/notes.png"),
+            ("Files", "Файлы", "icons/files.png"),
+            ("Weather", "Погода", "icons/weather.png"),
+            ("Calculator", "Калькулятор", "icons/calculator.png"),
+            ("Video", "Видео", "icons/video.png"),
+            ("Books", "Книги", "icons/books.png"),
+            ("Podcasts", "Подкасты", "icons/podcasts.png"),
+        ]
+        self.app_meta = {aid: (name, path) for aid, name, path in self.all_apps_data}
+        self.dock_apps_data = ["Phone", "Messages", "Browser", "Store"]
+
+        # состояние рабочего стола (порядок иконок + удалённые)
+        self._order = [aid for aid, _, _ in self.all_apps_data]
+        self._removed = []
+
+        # ------- локализация -------
+        self.localized_app_names = {
+            "Русский": {
+                "Greeting": "Добро пожаловать",
+                "Page2": "Приложения",
+                "EditDone": "Готово",
+                "Phone": "Телефон", "Messages": "Сообщения", "Camera": "Камера",
+                "Photos": "Фото", "Store": "Магазин", "Browser": "Браузер",
+                "Music": "Музыка", "Maps": "Карты", "Settings": "Настройки",
+                "Calendar": "Календарь", "Clock": "Часы", "Contacts": "Контакты",
+                "Notes": "Заметки", "Files": "Файлы", "Weather": "Погода",
+                "Calculator": "Калькулятор",
+                "Video": "Видео", "Books": "Книги", "Podcasts": "Подкасты",
+            },
+            "English": {
+                "Greeting": "Welcome",
+                "Page2": "Apps",
+                "EditDone": "Done",
+                "Phone": "Phone", "Messages": "Messages", "Camera": "Camera",
+                "Photos": "Photos", "Store": "Store", "Browser": "Browser",
+                "Music": "Music", "Maps": "Maps", "Settings": "Settings",
+                "Calendar": "Calendar", "Clock": "Clock", "Contacts": "Contacts",
+                "Notes": "Notes", "Files": "Files", "Weather": "Weather",
+                "Calculator": "Calculator",
+                "Video": "Video", "Books": "Books", "Podcasts": "Podcasts",
+            }
+        }
+
+        self.grid_app_icons = []
+        self.dock_app_icons = []
+
+        self.current_app_id_to_launch = None
+        self.current_icon_rect_for_animation = QRect()
+        self._should_animate_on_show = True
+
+        # fluid-состояния
+        self._page = 0
+        self._pages_visible = 1
+        self._slide_pos = 0.0          # 0 = стр.0, 1 = стр.1 (float, свайп/скролл)
+        self._slide_target = 0.0
+        self._slide_driver = None
+        self._edit_mode = False
+        self._long_press_timer = None
+        self._press_icon = None
+        self._press_global_pos = None
+        self._drag_ghost = None
+        self._drag_app_id = None
+        self._dock_magnet_idx = -1
+
+        self.init_ui()
+        self._rebuild_pages()
+
+    # ============================ UI ============================
+    def init_ui(self):
+        main_vlayout = QVBoxLayout(self)
+        main_vlayout.setContentsMargins(20, 30, 20, 10)
+        main_vlayout.setSpacing(0)
+
+        # --- ФЛЮИД: живой mesh-фон внутри лаунчера ---
+        self.fluid_bg = FluidHomeBackground(self)
+        self.fluid_bg.lower()
+
+        # --- Верхняя часть: крупный iOS-заголовок + дата ---
+        head = QVBoxLayout()
+        head.setSpacing(2)
+        self.greeting_label = QLabel("")
+        self.greeting_label.setObjectName("homeGreeting")
+        self.date_label = QLabel("")
+        self.date_label.setObjectName("homeDate")
+        head.addWidget(self.greeting_label)
+        head.addWidget(self.date_label)
+        main_vlayout.addLayout(head)
+        main_vlayout.addSpacing(26)
+
+        # --- Контейнер двух страниц (fluid horizontal slide) ---
+        self.pages_host = QWidget(self)
+        self.pages_host.setStyleSheet("background: transparent;")
+        self.page_widgets = []
+        self.page_grids = []
+        for idx in range(2):
+            host = QWidget(self.pages_host)
+            host.setStyleSheet("background: transparent;")
+            grid = QGridLayout(host)
+            grid.setContentsMargins(4, 0, 4, 0)
+            grid.setHorizontalSpacing(14)
+            grid.setVerticalSpacing(20)
+            grid.setAlignment(Qt.AlignTop | Qt.AlignHCenter)
+            self.page_widgets.append(host)
+            self.page_grids.append(grid)
+        self.pages_host.setMinimumHeight(420)
+        main_vlayout.addWidget(self.pages_host, 1)
+
+        # --- page dots ---
+        self.page_dots = PageDots(2, self)
+        self.page_dots.dot_clicked.connect(self._on_dot_clicked)
+        dots_row = QHBoxLayout()
+        dots_row.addStretch(1)
+        dots_row.addWidget(self.page_dots)
+        dots_row.addStretch(1)
+        main_vlayout.addLayout(dots_row)
+        main_vlayout.addSpacing(10)
+
+        # --- кнопка «Готово» в режиме редактирования ---
+        self.done_button = QPushButton("Готово")
+        self.done_button.setObjectName("editDoneButton")
+        self.done_button.setCursor(Qt.PointingHandCursor)
+        self.done_button.setFixedHeight(44)
+        self.done_button.clicked.connect(lambda: self.set_edit_mode(False))
+        self.done_button.hide()
+        main_vlayout.addWidget(self.done_button, alignment=Qt.AlignHCenter)
+        main_vlayout.addSpacing(6)
+
+        # --- ДОК: стеклянная капсула с magnification ---
+        self.dock_frame = QFrame(self)
+        self.dock_frame.setObjectName("fluidDock")
+        self.dock_frame.setFixedHeight(96)
+        self.dock_frame.setMaximumWidth(500)
+        self.dock_layout = QHBoxLayout(self.dock_frame)
+        self.dock_layout.setContentsMargins(24, 12, 24, 12)
+        self.dock_layout.setSpacing(18)
+        self.dock_layout.setAlignment(Qt.AlignCenter)
+
+        main_vlayout.addWidget(self.dock_frame, alignment=Qt.AlignCenter)
+        main_vlayout.addSpacing(12)
+
+        self._populate_dock_apps()
+        self._update_localization()
+        self._update_date()
+        self._date_timer = QTimer(self)
+        self._date_timer.timeout.connect(self._update_date)
+        self._date_timer.start(30000)
+
+    def _locale(self):
+        return self.localized_app_names.get(self._language,
+                                            self.localized_app_names["Русский"])
+
+    def _display_name(self, app_id: str) -> str:
+        default = self.app_meta.get(app_id, (app_id, ""))[0]
+        return self._locale().get(app_id, default)
+
+    def _icon_path(self, app_id: str) -> str:
+        return self.app_meta.get(app_id, ("", "icons/default_app_icon.png"))[1]
+
+    def _update_date(self):
+        try:
+            from datetime import datetime
+            now = datetime.now()
+            months_ru = ["января", "февраля", "марта", "апреля", "мая", "июня",
+                         "июля", "августа", "сентября", "октября", "ноября", "декабря"]
+            days_ru = ["понедельник", "вторник", "среда", "четверг",
+                       "пятница", "суббота", "воскресенье"]
+            wd = days_ru[now.weekday()]
+            wd = wd[0].upper() + wd[1:]
+            if self._language == "English":
+                txt = now.strftime("%A, %B %d")
+            else:
+                txt = f"{wd}, {now.day} {months_ru[now.month - 1]}"
+            self.date_label.setText(txt)
+        except Exception:
+            pass
+
+    # ============================ СТРАНИЦЫ ============================
+    def _visible_order(self):
+        return [aid for aid in self._order if aid not in self._removed]
+
+    def _rebuild_pages(self, morph=True):
+        """Пересобирает обе страницы сетки из self._order (с учётом удалённых)."""
+        for grid in self.page_grids:
+            while grid.count():
+                item = grid.takeAt(0)
+                w = item.widget()
+                if w:
+                    w.setParent(None)
+                    w.deleteLater()
+        self.grid_app_icons = []
+
+        ids = self._visible_order()
+        pages = [ids[:self.APPS_PER_PAGE], ids[self.APPS_PER_PAGE:self.APPS_PER_PAGE * 2]]
+        cols = self._current_grid_columns
+        for pi, page_ids in enumerate(pages):
+            grid = self.page_grids[pi]
+            for i, aid in enumerate(page_ids):
+                row, col = divmod(i, cols)
+                icon = AppIcon(aid, self._display_name(aid), self._icon_path(aid),
+                               self.page_widgets[pi], is_dock_icon=False,
+                               initial_icon_draw_size=self._current_icon_size,
+                               initial_show_name=self._show_app_names)
+                icon.app_icon_pressed.connect(self._handle_app_icon_pressed)
+                icon.remove_clicked.connect(self._remove_app)
+                icon.set_edit_mode(self._edit_mode)
+                grid.addWidget(icon, row, col, Qt.AlignHCenter | Qt.AlignTop)
+                self.grid_app_icons.append(icon)
+            for c in range(max(cols, 1)):
+                grid.setColumnStretch(c, 1)
+
+        need = 2 if len(ids) > self.APPS_PER_PAGE else 1
+        self._pages_visible = need
+        self.page_dots.set_count(need)
+        self._slide_target = float(min(self._page, need - 1))
+        self._page = int(round(self._slide_target))
+        self.page_dots.set_current(self._page)
+        self._layout_pages(animated=morph)
+
+    def _layout_pages(self, animated=True):
+        """Раскладывает две страницы с учётом self._slide_pos (0..1).
+        FLUID: параллакс — вторая страница чуть отстаёт (глубина)."""
+        w = self.pages_host.width() or self.width() - 40
+        h = self.pages_host.height() or 420
+        p = self._slide_pos
+        max_off = max(0, self._pages_visible - 1) if hasattr(self, "_pages_visible") else 1
+        cur = max(0.0, min(float(max_off), p))
+        for i, host in enumerate(self.page_widgets):
+            off = (i - cur) * (w * 0.94)      # соседняя видна на 6% — peek
+            depth = 1.0 - min(1.0, abs(i - cur)) * 0.06
+            ww = int(w * depth)
+            hh = int(h * depth)
+            host.setGeometry(int((w - ww) // 2 + off), (h - hh) // 2, ww, hh)
+            host.show() if i < getattr(self, "_pages_visible", 2) else host.hide()
+            eff = host.graphicsEffect()
+            if not isinstance(eff, QGraphicsOpacityEffect):
+                eff = QGraphicsOpacityEffect(host)
+                host.setGraphicsEffect(eff)
+            eff.setOpacity(max(0.15, 1.0 - min(1.0, abs(i - cur)) * 0.85))
+
+    def _animate_slide_to(self, target: float, duration=Duration.TRANSITION):
+        start = self._slide_pos
+        if abs(target - start) < 1e-4:
+            return
+        if self._slide_driver is not None:
+            self._slide_driver.stop()
+        new_page = int(round(max(0.0, min(1.0, target))))
+
+        def finish():
+            self._slide_driver = None
+            self._slide_pos = target
+            self._page = new_page
+            self.page_dots.set_current(new_page)
+            self._layout_pages()
+
+        driver = _FrameDriver(duration, Easing.SPRING,
+                              lambda p: self._set_slide(start + (target - start) * p),
+                              finish, self)
+        self._slide_driver = driver
+        driver.start()
+
+    def _set_slide(self, v: float):
+        self._slide_pos = max(-0.06, min(1.06, v))
+        self._layout_pages()
+
+    def wheelEvent(self, event):
+        """FLUID: вертикальное колесо листает страницы домой (как swipe на iOS)."""
+        delta = event.angleDelta().y()
+        if getattr(self, "_pages_visible", 1) > 1 and abs(delta) >= 24:
+            if delta < 0 and self._page < self._pages_visible - 1:
+                self._animate_slide_to(self._page + 1)
+                event.accept()
+                return
+            if delta > 0 and self._page > 0:
+                self._animate_slide_to(self._page - 1)
+                event.accept()
+                return
+        super().wheelEvent(event)
+
+    def keyPressEvent(self, event):
+        if event.key() in (Qt.Key_Right, Qt.Key_Down) and \
+                getattr(self, "_pages_visible", 1) > 1 and self._page < self._pages_visible - 1:
+            self._animate_slide_to(self._page + 1)
+            return
+        if event.key() in (Qt.Key_Left, Qt.Key_Up) and self._page > 0:
+            self._animate_slide_to(self._page - 1)
+            return
+        super().keyPressEvent(event)
+
+    def _on_dot_clicked(self, idx: int):
+        self._animate_slide_to(float(idx))
+
+    def resizeEvent(self, event):
+        self.fluid_bg.setGeometry(self.rect())
+        self.fluid_bg.lower()
+        self._layout_pages(animated=False)
+        super().resizeEvent(event)
+
+    # ============================ ДОК ============================
+    def _populate_dock_apps(self):
+        while self.dock_layout.count():
+            item = self.dock_layout.takeAt(0)
+            widget = item.widget()
+            if widget:
+                widget.setParent(None)
+                widget.deleteLater()
+        self.dock_app_icons = []
+        for aid in self.dock_apps_data:
+            icon = AppIcon(aid, self._display_name(aid), self._icon_path(aid),
+                           self.dock_frame, is_dock_icon=True,
+                           initial_icon_draw_size=self.DOCK_SIZE)
+            icon.app_icon_pressed.connect(self._handle_app_icon_pressed)
+            self.dock_layout.addWidget(icon)
+            self.dock_app_icons.append(icon)
+
+    def mouseMoveEvent(self, event):
+        """FLUID: magnification дока — иконки растут под курсором (iOS Dock)."""
+        if self._drag_ghost is not None:
+            self._drag_move(event)
+            return
+        gp = event.pos()
+        best, best_d = -1, 1e9
+        for i, ic in enumerate(self.dock_app_icons):
+            c_local = ic.mapTo(self, ic.rect().center())
+            d = math.hypot(gp.x() - c_local.x(), gp.y() - c_local.y())
+            if d < best_d:
+                best, best_d = i, d
+        if best != self._dock_magnet_idx or best_d < 160:
+            sigma = 95.0
+            for i, ic in enumerate(self.dock_app_icons):
+                c_local = ic.mapTo(self, ic.rect().center())
+                d = math.hypot(gp.x() - c_local.x(), gp.y() - c_local.y())
+                target_mag = 1.0 + 0.32 * math.exp(-(d * d) / (2 * sigma * sigma))
+                anim = animate(ic, b"magnet", ic.magnet, target_mag,
+                               Duration.SHORT, Easing.SPRING, self)
+                anim.start()
+            self._dock_magnet_idx = best
+        super().mouseMoveEvent(event)
+
+    def leaveEvent(self, event):
+        for ic in self.dock_app_icons:
+            anim = animate(ic, b"magnet", ic.magnet, 1.0,
+                           Duration.STANDARD, Easing.SPRING, self)
+            anim.start()
+        self._dock_magnet_idx = -1
+        super().leaveEvent(event)
+
+    # ============================ РЕЖИМ РЕДАКТИРОВАНИЯ ============================
+    def set_edit_mode(self, on: bool):
+        if self._edit_mode == on:
+            return
+        self._edit_mode = on
+        for icon in self.grid_app_icons:
+            icon.set_edit_mode(on)
+        self.done_button.setVisible(on)
+        if on:
+            # FLUID: лёгкий pop всего контента при входе в режим
+            self._stagger_pulse()
+        else:
+            self._save_desktop()
+
+    def _stagger_pulse(self):
+        for i, ic in enumerate(self.grid_app_icons[:8]):
+            QTimer.singleShot(i * 22, lambda icon=ic: (
+                icon._spring.to(1.05, Duration.SHORT, Easing.SPRING),
+                QTimer.singleShot(Duration.SHORT,
+                                  lambda: icon._spring.to(1.0, Duration.SHORT, Easing.SPRING))))
+
+    def _remove_app(self, app_id: str):
+        if app_id in self.dock_apps_data:
+            return
+        if app_id in self._removed:
+            return
+        self._removed.append(app_id)
+        # FLUID: схлопывание удаляемой плитки перед перестройкой
+        victim = next((ic for ic in self.grid_app_icons if ic.app_id == app_id), None)
+        if victim is not None and not sip_is_dead(victim):
+            def gone():
+                self._rebuild_pages()
+                self._save_desktop()
+            anim = animate(victim, b"scale", 1.0, 0.0, Duration.SHORT,
+                           Easing.ACCELERATE, self)
+            anim.finished.connect(gone)
+            anim.start()
+        else:
+            self._rebuild_pages()
+            self._save_desktop()
+
+    def _restore_last(self):
+        """Кнопка «+»: возвращает последнее удалённое приложение."""
+        if not self._removed:
+            return
+        aid = self._removed.pop()
+        if aid not in self._order:
+            self._order.insert(0, aid)
+        self._rebuild_pages()
+        self._save_desktop()
+        new = next((ic for ic in self.grid_app_icons if ic.app_id == aid), None)
+        if new is not None:
+            new._scale_factor = 0.0
+            anim = animate(new, b"scale", 0.0, 1.0, Duration.SHORT,
+                           Easing.SPRING, self)
+            anim.start()
+
+    # -------- drag & drop в режиме редактирования --------
+    def _begin_drag_if_needed(self, icon, event_pos_global):
+        if not self._edit_mode or icon.is_dock_icon:
+            return
+        if self._drag_ghost is not None:
+            return
+        self._drag_app_id = icon.app_id
+        pix = icon._original_pixmap.scaled(
+            icon._icon_draw_size, icon._icon_draw_size,
+            Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        ghost = QLabel(self)
+        ghost.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
+        ghost.setAttribute(Qt.WA_TranslucentBackground)
+        ghost.setAttribute(Qt.WA_ShowWithoutActivating)
+        ghost.setAlignment(Qt.AlignCenter)
+        s = icon._icon_draw_size
+        canvas = QPixmap(s + 24, s + 24)
+        canvas.fill(Qt.transparent)
+        pp = QPainter(canvas)
+        pp.setRenderHint(QPainter.Antialiasing)
+        rr = QRectF(12, 12, s, s)
+        pp.setClipPath(_rounded_superellipse(rr))
+        pp.drawPixmap(12, 12, pix)
+        pp.restore()
+        ghost.setPixmap(canvas)
+        ghost.resize(canvas.size())
+        ghost.move(event_pos_global - QPoint(s // 2, s // 2))
+        ghost.show()
+        self._drag_ghost = ghost
+        icon.opacity = 0.25
+
+    def _drag_move(self, event):
+        if self._drag_ghost is None:
+            return
+        self._drag_ghost.move(event.globalPos()
+                              - QPoint(self._drag_ghost.width() // 2,
+                                       self._drag_ghost.height() // 2))
+
+    def _drag_finish(self, event):
+        ghost = self._drag_ghost
+        if ghost is None:
+            return
+        target_x = event.globalPos().x()
+        # определить целевую страницу по X относительно центра pages_host
+        center_x = self.pages_host.mapTo(self, self.pages_host.rect().center()).x()
+        dest_page = 1 if target_x > center_x else 0
+        dest_page = min(dest_page, getattr(self, "_pages_visible", 2) - 1)
+        src_ids = self._visible_order()
+        aid = self._drag_app_id
+        self._drag_ghost = None
+        self._drag_app_id = None
+        ghost.deleteLater()
+        if aid in src_ids:
+            src_ids.remove(aid)
+            lo = dest_page * self.APPS_PER_PAGE
+            hi = lo + self.APPS_PER_PAGE
+            full = src_ids[:lo] + [aid] + src_ids[lo:] if False else None
+            # вставляем так, чтобы порядок оставался плоским:
+            merged = src_ids[:lo] + [aid] + src_ids[lo:]
+            # переписать self._order: удалённые сохраняем в конце
+            tail = [a for a in self._order if a in self._removed]
+            self._order = merged + tail
+            self._rebuild_pages()
+            self._save_desktop()
+        moved = next((ic for ic in self.grid_app_icons if ic.app_id == aid), None)
+        if moved is not None:
+            moved.opacity = 1.0
+            moved._spring.to(1.08, Duration.SHORT, Easing.SPRING)
+            QTimer.singleShot(Duration.SHORT,
+                              lambda: moved._spring.to(1.0, Duration.SHORT, Easing.SPRING))
+        self._animate_slide_to(float(dest_page))
+
+    # ============================ ЛОКАЛИЗАЦИЯ / НАСТРОЙКИ ============================
+    def set_language(self, language: str):
+        if self._language != language:
+            self._language = language
+            self._update_localization()
+
+    def _update_localization(self):
+        current_locale = self._locale()
+        username = getattr(self.main_window, "current_username", None) or "Пользователь"
+        if username in ("None", ""):
+            username = "Пользователь"
+        base_greeting = current_locale.get("Greeting", "Добро пожаловать")
+        self.greeting_label.setText(f"{base_greeting}, {username}")
+        self.done_button.setText(current_locale.get("EditDone", "Готово"))
+        for icon in self.grid_app_icons + self.dock_app_icons:
+            new_name = current_locale.get(icon.app_id, icon.app_name)
+            icon.app_name = new_name
+            if icon.name_label:
+                icon._elide_name(new_name)
+
+    def set_icon_size(self, size: int):
+        if self._current_icon_size != size:
+            self._current_icon_size = size
+            self._rebuild_pages()
+
+    def set_grid_columns(self, columns: int):
+        if self._current_grid_columns != columns:
+            self._current_grid_columns = columns
+            self._rebuild_pages()
+
+    def set_app_names_visibility(self, visible: bool):
+        if self._show_app_names != visible:
+            self._show_app_names = visible
+            for icon in self.grid_app_icons:
+                icon.set_app_name_visibility(visible)
+
+    # ============================ СОХРАНЕНИЕ РАБОЧЕГО СТОЛА ============================
+    def _desktop_file(self):
+        base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        return os.path.join(base, "Modules", "launcher_desktop.json")
+
+    def _save_desktop(self):
+        """Сохраняет кастомизацию рабочего стола: через user_data_manager OS
+        (ключи launcher_*), и дополнительно в sidecar-файл Modules/."""
+        try:
+            if self.user_data_manager is not None:
+                try:
+                    data = dict(self.user_data_manager.load_user_data() or {})
+                except Exception:
+                    data = {}
+                data["launcher_order"] = self._order
+                data["launcher_removed"] = self._removed
+                data["launcher_dock"] = self.dock_apps_data
+                try:
+                    self.user_data_manager.save_user_data(data)
+                except Exception:
+                    pass
+            import json
+            path = self._desktop_file()
+            existing = {}
+            if os.path.exists(path):
+                with open(path, "r", encoding="utf-8") as f:
+                    existing = json.load(f)
+            existing["launcher_order"] = self._order
+            existing["launcher_removed"] = self._removed
+            existing["launcher_dock"] = self.dock_apps_data
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(existing, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"Launcher: не удалось сохранить рабочий стол: {e}")
+
+    def load_desktop(self, data=None):
+        """Загружает кастомизацию. data — dict из user_data_manager (если есть),
+        иначе читается sidecar-файл Modules/launcher_desktop.json."""
+        try:
+            import json
+            if data is None:
+                path = self._desktop_file()
+                data = {}
+                if os.path.exists(path):
+                    with open(path, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+            known = {aid for aid, _, _ in self.all_apps_data}
+            order = data.get("launcher_order")
+            if isinstance(order, list):
+                clean = [a for a in order if a in known]
+                for aid, _, _ in self.all_apps_data:
+                    if aid not in clean:
+                        clean.append(aid)
+                self._order = clean
+            removed = data.get("launcher_removed")
+            if isinstance(removed, list):
+                self._removed = [a for a in removed if a in known and a not in self.dock_apps_data]
+            dock = data.get("launcher_dock")
+            if isinstance(dock, list) and dock:
+                self.dock_apps_data = [a for a in dock if a in known][:4]
+            self._populate_dock_apps()
+            self._rebuild_pages()
+            self._update_localization()
+        except Exception as e:
+            print(f"Launcher: не удалось загрузить рабочий стол: {e}")
+
+    # ============================ ЗАПУСК ПРИЛОЖЕНИЙ ============================
+    def _handle_app_icon_pressed(self, app_id: str, icon_rect: QRect):
+        """Нажатие: в режиме редактирования long-press начинает drag&drop;
+        иначе — морф-запуск приложения (zoom transition iOS)."""
+        if self._edit_mode:
+            src = self.sender()
+            if isinstance(src, AppIcon) and not src.is_dock_icon:
+                self._begin_drag_if_needed(src, icon_rect.topLeft())
+            return
+        self.current_app_id_to_launch = app_id
+        self.current_icon_rect_for_animation = icon_rect
+
+        root = self.window()
+        target_rect = QRect(root.rect().topLeft(), root.size()) if root else QRect(icon_rect)
+        src_icon = None
+        for ic in self.grid_app_icons + self.dock_app_icons:
+            if ic.app_id == app_id:
+                src_icon = ic
+                break
+        pixmap = src_icon._original_pixmap if src_icon else None
+
+        self._morph_pending = False
+        self._morph = MorphOverlay(root, icon_rect, target_rect, pixmap=pixmap,
+                                   corner_start=int(self._current_icon_size * 0.295),
+                                   corner_end=0)
+
+        if getattr(self, "_flyin_driver", None) is not None:
+            self._flyin_driver.stop()
+            self._flyin_driver = None
+        for icon in self.grid_app_icons + self.dock_app_icons:
+            icon._opacity = 1.0
+            icon._scale_factor = 1.0
+            base = getattr(icon, "_flyin_base_y", None)
+            if base is not None:
+                icon.move(icon.x(), base)
+            icon.update()
+
+        eff = QGraphicsOpacityEffect(self)
+        self.setGraphicsEffect(eff)
+        base_size = self.size()
+        base_pos = self.pos()
+
+        def launch_out_frame(p):
+            eff.setOpacity(1.0 - p)
+            s = 1.0 - 0.06 * p
+            w = max(1, int(base_size.width() * s))
+            h = max(1, int(base_size.height() * s))
+            self.setGeometry(base_pos.x() + (base_size.width() - w) // 2,
+                             base_pos.y() + (base_size.height() - h) // 2,
+                             w, h)
+
+        self._launch_out_driver = _FrameDriver(
+            Duration.LAUNCH, Easing.ACCELERATE, launch_out_frame,
+            on_finished=self._on_outgoing_animation_finished, parent=self)
+        self._launch_out_driver.start()
+
+        def _emit_launch():
+            self._morph_pending = True
+            self._on_outgoing_animation_finished()
+
+        self._morph.run_open(duration=Duration.LAUNCH, curve=Easing.STANDARD,
+                             on_finished=_emit_launch)
+
+    def _on_outgoing_animation_finished(self):
+        self.setGraphicsEffect(None)
+        if getattr(self, "_launch_out_driver", None) is not None:
+            self._launch_out_driver.stop()
+            self._launch_out_driver = None
+        if self.parent() is not None:
+            try:
+                self.setGeometry(self.parent().geometry())
+            except RuntimeError:
+                pass
+        self.hide()
+
+        if getattr(self, "_morph_pending", False):
+            self._morph_pending = False
+            self.launch_app_requested.emit(self.current_app_id_to_launch,
+                                           self.current_icon_rect_for_animation)
+
+    # ============================ ПОЯВЛЕНИЕ (FLUID) ============================
+    def animate_icons_in(self, origin=None):
+        """FLUID-прилёт: иконки прилетают снизу с spring-оседанием; при заданной
+        origin волна расходится ОТ точки (например от кнопки OOBE). Фон делает
+        световой pulse одновременно."""
+        all_icons = self.grid_app_icons + self.dock_app_icons
+        if not all_icons or all(i.height() <= 0 for i in all_icons):
+            QTimer.singleShot(0, lambda: self.animate_icons_in(origin))
+            return
+
+        self.fluid_bg.pulse()
+
+        for icon in all_icons:
+            icon._scale_factor = 1.0
+            icon.opacity = 0.0
+            icon.show()
+
+        if getattr(self, "_flyin_driver", None) is not None:
+            self._flyin_driver.stop()
+            self._flyin_driver = None
+
+        entries = []
+        columns = max(1, self._current_grid_columns)
+        for i, icon in enumerate(self.grid_app_icons):
+            row, col = divmod(i, columns)
+            if origin is not None:
+                c = icon.mapTo(self, icon.rect().center())
+                dist = math.hypot(c.x() - origin.x(), c.y() - origin.y())
+                off = min(0.45, dist / max(1.0, self.width() * 1.4))
+            else:
+                off = (row + col) * 0.045
+            entries.append((icon, off))
+        for j, icon in enumerate(self.dock_app_icons):
+            entries.append((icon, 0.02 + j * 0.05))
+
+        total_ms = Duration.STANDARD + 300
+
+        greeting = getattr(self, "greeting_label", None)
+        greet_base_y = greeting.y() if greeting is not None else 0
+        date_lbl = getattr(self, "date_label", None)
+        date_base_y = date_lbl.y() if date_lbl is not None else 0
+
+        greet_eff = None
+        if greeting is not None:
+            greet_eff = QGraphicsOpacityEffect(greeting)
+            greet_eff.setOpacity(0.0)
+            greeting.setGraphicsEffect(greet_eff)
+
+        def on_frame(p):
+            for icon, off in entries:
+                lp = max(0.0, min(1.0, (p - off) / max(1e-6, 1.0 - off)))
+                dy, scale, opacity = fly_in_transform(lp)
+                icon.set_scale(scale)
+                icon.opacity = opacity
+                base = getattr(icon, "_flyin_base_y", None)
+                if base is None:
+                    base = icon.y()
+                    icon._flyin_base_y = base
+                icon.move(icon.x(), int(base + dy))
+            if greeting is not None and greet_eff is not None:
+                gp = max(0.0, min(1.0, p / 0.55))
+                s = spring_progress(gp)
+                greeting.move(greeting.x(), int(greet_base_y + 18.0 * (1.0 - s)))
+                greet_eff.setOpacity(min(1.0, p * 2.2))
+            if date_lbl is not None:
+                dp = max(0.0, min(1.0, (p - 0.08) / 0.55))
+                s = spring_progress(dp)
+                date_lbl.move(date_lbl.x(), int(date_base_y + 12.0 * (1.0 - s)))
+
+        def finish():
+            self._flyin_driver = None
+            for icon, _ in entries:
+                icon.set_scale(1.0)
+                icon.opacity = 1.0
+                base = getattr(icon, "_flyin_base_y", None)
+                if base is not None:
+                    icon.move(icon.x(), base)
+            if greeting is not None:
+                greeting.move(greeting.x(), greet_base_y)
+                greeting.setGraphicsEffect(None)
+            if date_lbl is not None:
+                date_lbl.move(date_lbl.x(), date_base_y)
+
+        self._flyin_driver = _FrameDriver(total_ms, QEasingCurve.Linear,
+                                          on_frame, finish, self)
+        self._flyin_driver.start()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        # FLUID: каждый возврат домой — короткий световой импульс фона
+        self.fluid_bg.pulse()
+        if self._should_animate_on_show:
+            self.animate_icons_in()
+            self._should_animate_on_show = False
+
+    def prepare_for_animation(self):
+        self._should_animate_on_show = True
+        for icon in self.grid_app_icons + self.dock_app_icons:
+            icon.reset_animation_state()
+
+    # ============================ МЫШЬ: long-press / drag ============================
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            child = self.childAt(event.pos())
+            icon = None
+            w = child
+            while w is not None and not isinstance(w, AppIcon):
+                w = w.parentWidget()
+            icon = w
+            if icon is not None and not icon.is_dock_icon and self._edit_mode:
+                self._press_icon = icon
+                self._press_global_pos = event.globalPos()
+                self._long_press_timer = QTimer(self)
+                self._long_press_timer.setSingleShot(True)
+                self._long_press_timer.timeout.connect(self._start_long_press_drag)
+                self._long_press_timer.start(self.LONG_PRESS_MS)
+        super().mousePressEvent(event)
+
+    def _start_long_press_drag(self):
+        icon = getattr(self, "_press_icon", None)
+        gp = getattr(self, "_press_global_pos", None)
+        if icon is None or gp is None:
+            return
+        self._begin_drag_if_needed(icon, gp)
+
+    def mouseReleaseEvent(self, event):
+        timer = getattr(self, "_long_press_timer", None)
+        if timer is not None:
+            timer.stop()
+            self._long_press_timer = None
+        if self._drag_ghost is not None:
+            self._drag_finish(event)
+        self._press_icon = None
+        self._press_global_pos = None
+        super().mouseReleaseEvent(event)
+
+    # ============================ РИСОВАНИЕ ФОНА ============================
+    def paintEvent(self, event):
+        # фон рисуется FluidHomeBackground-виджетом; здесь — только базовый слой
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor(BG))
+        painter.end()
+        QWidget.paintEvent(self, event)
+
+
+# Стили (QSS без синтаксических ошибок — никаких незакрытых блоков!)
+LAUNCHER_QSS = f"""
+QLabel#homeGreeting {{
+    color: white; font-size: 26px; font-weight: 700;
+    font-family: 'SF Pro Display', 'Segoe UI', 'Roboto', sans-serif;
+    background: transparent;
+}}
+QLabel#homeDate {{
+    color: rgba(255,255,255,0.55); font-size: 14px; font-weight: 500;
+    font-family: 'SF Pro Text', 'Segoe UI', 'Roboto', sans-serif;
+    background: transparent;
+}}
+QFrame#fluidDock {{
+    background-color: rgba(255, 255, 255, 0.10);
+    border-radius: 34px;
+    border: 1px solid rgba(255, 255, 255, 0.14);
+}}
+QPushButton#editDoneButton {{
+    background-color: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+        stop:0 {ACCENT}, stop:1 #3D8BFF);
+    color: white; border: none; border-radius: 14px;
+    padding: 10px 26px; font-size: 15px; font-weight: 700;
+}}
+QPushButton#editDoneButton:hover {{
+    background-color: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+        stop:0 #0a74e0, stop:1 #2f7ce8);
+}}
+QPushButton#editDoneButton:pressed {{ background-color: #0860bb; }}
+"""
+
+
+# Пример использования (для тестирования только лаунчера)
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+
+    main_test_window = QMainWindow()
+    main_test_window.setGeometry(100, 100, 519, 950)
+    main_test_window.setStyleSheet("background-color: black;")
+
+    launcher = LauncherContent(main_test_window, language="Русский")
+    launcher.launch_app_requested.connect(
+        lambda app_id, icon_rect: print(f"Launcher requested launch of: {app_id} from {icon_rect}"))
+
+    test_layout = QVBoxLayout()
+    test_layout.setContentsMargins(0, 0, 0, 0)
+    test_layout.addWidget(launcher)
+
+    central_widget = QWidget()
+    central_widget.setLayout(test_layout)
+    main_test_window.setCentralWidget(central_widget)
+    main_test_window.show()
+
+    QTimer.singleShot(1000, launcher.animate_icons_in)
+
+    # Тестирование настроек лаунчера
+    QTimer.singleShot(3000, lambda: launcher.set_icon_size(50))
+    QTimer.singleShot(4000, lambda: launcher.set_grid_columns(5))
+    QTimer.singleShot(5000, lambda: launcher.set_app_names_visibility(False))
+    QTimer.singleShot(6000, lambda: launcher.set_icon_size(90))
+    QTimer.singleShot(7000, lambda: launcher.set_app_names_visibility(True))
+    QTimer.singleShot(8000, lambda: launcher.set_grid_columns(3))
+    QTimer.singleShot(9000, lambda: launcher.set_edit_mode(True))
+    QTimer.singleShot(11000, lambda: launcher.set_edit_mode(False))
+
+    sys.exit(app.exec_())

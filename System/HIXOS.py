@@ -11,9 +11,9 @@ from PyQt5.QtCore import Qt, QTimer, QSize, pyqtSignal, QTime, QPropertyAnimatio
 
 # --- Системный движок анимаций (OxygenOS / iOS style) ---
 try:
-    from ui.animation_engine import Easing, Duration, PageSwipe, MorphOverlay, _FrameDriver
+    from ui.animation_engine import Easing, Duration, PageSwipe, MorphOverlay, _FrameDriver, spring_progress
 except ImportError:
-    from animation_engine import Easing, Duration, PageSwipe, MorphOverlay, _FrameDriver
+    from animation_engine import Easing, Duration, PageSwipe, MorphOverlay, _FrameDriver, spring_progress
 
 import os
 import json # Import for JSON parsing
@@ -567,7 +567,10 @@ class MainWindow(QMainWindow):
         self.setup_page = OOBEContent(self,
                                       current_language=self.current_language,
                                       initial_navigation_mode=self.current_navigation_mode,
-                                      user_data_manager=self.user_data_manager) 
+                                      user_data_manager=self.user_data_manager,
+                                      initial_icon_size=self.launcher_icon_size,
+                                      initial_grid_columns=self.launcher_grid_columns,
+                                      initial_show_app_names=self.launcher_show_app_names) 
         # Pass launcher settings to LauncherContent
         self.launcher_page = LauncherContent(self, 
                                              self.current_language,
@@ -655,6 +658,9 @@ class MainWindow(QMainWindow):
         self.settings_page.launcher_icon_size_changed.connect(self.on_launcher_icon_size_changed)
         self.settings_page.launcher_grid_columns_changed.connect(self.on_launcher_grid_columns_changed)
         self.settings_page.launcher_app_names_visibility_changed.connect(self.on_launcher_app_names_visibility_changed)
+
+        # НОВЫЕ ПОДКЛЮЧЕНИЯ: live-применение настроек лаунчера прямо из OOBE
+        self.setup_page.launcher_settings_changed.connect(self._on_oobe_launcher_settings)
 
 
     def init_ui(self):
@@ -1290,8 +1296,20 @@ class MainWindow(QMainWindow):
         self.current_navigation_mode = navigation_mode
         self.current_username = username 
 
-        # self.user_data_manager.save_user_data(...) # Commented out to disable saving
-        print(f"OOBE completed (data not saved). System language: {self.current_language}, navigation mode: {self.current_navigation_mode}, username: {self.current_username}.")
+        # Сохраняем данные OOBE + новые настройки оформления лаунчера
+        try:
+            self.user_data_manager.save_user_data({
+                "username": username,
+                "language": language,
+                "navigation_mode": navigation_mode,
+                "system_version": self.system_version,
+                "launcher_icon_size": self.launcher_icon_size,
+                "launcher_grid_columns": self.launcher_grid_columns,
+                "launcher_show_app_names": self.launcher_show_app_names,
+            })
+        except Exception as e:
+            print(f"OOBE: не удалось сохранить данные пользователя: {e}")
+        print(f"OOBE completed. System language: {self.current_language}, navigation mode: {self.current_navigation_mode}, username: {self.current_username}.")
         
         self.navigation_bar.set_navigation_mode(self.current_navigation_mode)
 
@@ -1305,6 +1323,9 @@ class MainWindow(QMainWindow):
         self._set_bars_ink(False)
         self.setFocusProxy(self.launcher_page)
         self.last_unlocked_page = self.launcher_page
+
+        # Применяем выбранные в OOBE настройки оформления к лаунчеру/настройкам
+        self._apply_launcher_settings_to_pages()
 
         # Волна появления иконок расходится ОТ кнопки «Начать работу»
         origin = None
@@ -1347,6 +1368,29 @@ class MainWindow(QMainWindow):
         self._set_bars_ink(is_light)
 
     # --- НОВЫЕ МЕТОДЫ: Обработчики для настроек лаунчера ---
+    def _on_oobe_launcher_settings(self, size: int, columns: int, show_names: bool):
+        """Live-применение настроек лаунчера из страницы OOBE (fluid-preview)."""
+        self.launcher_icon_size = size
+        self.launcher_grid_columns = columns
+        self.launcher_show_app_names = show_names
+        self._apply_launcher_settings_to_pages()
+
+    def _apply_launcher_settings_to_pages(self):
+        """Раскидывает текущие настройки лаунчера по лаунчеру и настройкам."""
+        try:
+            self.launcher_page.set_icon_size(self.launcher_icon_size)
+            self.launcher_page.set_grid_columns(self.launcher_grid_columns)
+            self.launcher_page.set_app_names_visibility(self.launcher_show_app_names)
+        except Exception as e:
+            print(f"MainWindow: не удалось применить настройки лаунчера: {e}")
+        try:
+            if hasattr(self.settings_page, "set_launcher_settings"):
+                self.settings_page.set_launcher_settings(
+                    self.launcher_icon_size, self.launcher_grid_columns,
+                    self.launcher_show_app_names)
+        except Exception:
+            pass
+
     def on_launcher_icon_size_changed(self, size: int):
         self.launcher_icon_size = size
         self.launcher_page.set_icon_size(size)

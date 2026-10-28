@@ -240,8 +240,11 @@ class _FrameDriver(QObject):
         self._clock.start()
         self._timer.start()
 
-    def stop(self):
+    def stop(self, emit_finished: bool = False):
+        was_active = self._timer.isActive()
         self._timer.stop()
+        if emit_finished and was_active and self._on_finished:
+            self._on_finished()
 
     def is_running(self) -> bool:
         return self._timer.isActive()

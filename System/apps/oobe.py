@@ -914,7 +914,7 @@ class LauncherStylePage(BaseOOBEPage):
         if checked:
             return (f"QPushButton {{ background-color: {ACCENT}; color: white;"
                     " border: none; border-radius: 13px; font-size: 16px;"
-                    " font-weight: 700; } }")
+                    " font-weight: 700; }")
         return ("QPushButton { background-color: rgba(255,255,255,0.07);"
                 " color: rgba(255,255,255,0.6); border: none;"
                 " border-radius: 13px; font-size: 16px; font-weight: 600; }"
@@ -1190,16 +1190,33 @@ class OOBEContent(QWidget):
                 self.navigation_choice_page.get_selected_navigation_mode()
 
     def _update_progress_indicator(self, index: int):
-        for i, dot in enumerate(self.progress_dots):
+        """FLUID: непрерывная капсула — сегменты плавно перетекают по яркости
+        и толщине (spring через движок анимаций системы)."""
+        # spring-анимация толщины сегментов
+        for anim in getattr(self, "_seg_anims", []):
+            try:
+                anim.stop()
+            except RuntimeError:
+                pass
+        self._seg_anims = []
+        for i, seg in enumerate(self.progress_segments):
+            target_h = 9 if i == index else 5
+            a = QPropertyAnimation(seg, b"minimumHeight", self)
+            a.setDuration(Duration.TRANSITION // 2)
+            a.setStartValue(seg.minimumHeight())
+            a.setEndValue(target_h)
+            a.setEasingCurve(Easing.SPRING)
+            a.start(QPropertyAnimation.DeleteWhenStopped)
+            self._seg_anims.append(a)
+        # цвет сегментов — через property+style, перерисовывается сразу
+        for i, seg in enumerate(self.progress_segments):
             if i == index:
-                dot.setFixedSize(22, 8)
-                dot.setStyleSheet(f"background-color: {ACCENT}; border-radius: 4px;")
+                col = ACCENT
             elif i < index:
-                dot.setFixedSize(8, 8)
-                dot.setStyleSheet("background-color: rgba(255,255,255,0.45); border-radius: 4px;")
+                col = "rgba(255,255,255,0.45)"
             else:
-                dot.setFixedSize(8, 8)
-                dot.setStyleSheet("background-color: rgba(255,255,255,0.18); border-radius: 4px;")
+                col = "rgba(255,255,255,0.16)"
+            seg.setStyleSheet(f"background-color: {col}; border-radius: 3px;")
 
     def _handle_oobe_finish(self, language, nav_mode, username):
         self._current_language = language

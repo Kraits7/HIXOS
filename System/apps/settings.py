@@ -14,10 +14,18 @@ from PyQt5.QtWidgets import (
     QSpinBox, QCheckBox # Добавлены для новых настроек
 )
 from PyQt5.QtGui import QFont, QPixmap, QMovie, QColor
-from PyQt5.QtCore import Qt, pyqtSignal, QSize, QTimer, QThread # Добавлен QThread для неблокирующих операций
+from PyQt5.QtCore import (Qt, pyqtSignal, pyqtProperty, QSize, QTimer, QThread, # Добавлен QThread для неблокирующих операций
+                          QPropertyAnimation, QEasingCurve, QRect, QPoint)
+from PyQt5.QtWidgets import QGraphicsOpacityEffect
 
 # Импортируем константы навигации
 from ui.navigation_bar import NAVIGATION_MODE_THREE_BUTTON
+
+# --- Системный движок анимаций (OxygenOS / iOS style) ---
+try:
+    from ui.animation_engine import Easing, Duration, PageSwipe, RippleButton
+except ImportError:
+    from animation_engine import Easing, Duration, PageSwipe, RippleButton
 
 # URL для проверки обновлений на GitHub (заглушка)
 # Замените на реальный репозиторий при необходимости
@@ -441,6 +449,64 @@ class LauncherSettingsPage(BaseSettingsSubPage):
 
 
 # --- Главный виджет настроек ---
+class PressableRow(QWidget):
+    """Строка настроек с press-эффектом в стиле OxygenOS/iOS: фон подсветки
+    плавно разгоняется и гаснет через QPropertyAnimation (не резкий toggle)."""
+
+    _BASE_QSS = """
+        PressableRow { background-color: %(bg)s; border-radius: 12px; }
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.setMinimumHeight(44)
+        self._highlight = 0.0
+        self._hl_anim = None
+        self._apply_bg()
+
+    def _apply_bg(self):
+        a = int(self._highlight * 255)
+        self.setStyleSheet(self._BASE_QSS % {"bg": f"rgba(255,255,255,{a})"})
+
+    def _animate_highlight(self, target: float, dur: int):
+        if self._hl_anim:
+            self._hl_anim.stop()
+        self._hl_anim = QPropertyAnimation(self, b"highlight", self)
+        self._hl_anim.setDuration(dur)
+        self._hl_anim.setStartValue(self._highlight)
+        self._hl_anim.setEndValue(target)
+        self._hl_anim.setEasingCurve(Easing.STANDARD if target > self._highlight else Easing.ACCELERATE)
+        self._hl_anim.start()
+
+    @pyqtProperty(float)
+    def highlight(self):
+        return self._highlight
+
+    @highlight.setter
+    def highlight(self, v):
+        self._highlight = v
+        self._apply_bg()
+
+    def enterEvent(self, event):
+        if self._highlight < 0.04:
+            self._animate_highlight(0.04, Duration.SHORT)
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self._animate_highlight(0.0, Duration.SHORT)
+        super().leaveEvent(event)
+
+    def mousePressEvent(self, event):
+        self._animate_highlight(0.10, Duration.MICRO)
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        inside = self.rect().contains(event.pos())
+        self._animate_highlight(0.04 if inside else 0.0, Duration.SHORT)
+        super().mouseReleaseEvent(event)
+
+
 class SettingsContent(QFrame):
     # Сигналы для связи с MainWindow
     go_back_to_launcher_requested = pyqtSignal()
@@ -579,6 +645,10 @@ class SettingsContent(QFrame):
         main_vlayout.setContentsMargins(0,0,0,0)
         main_vlayout.addWidget(self.stacked_pages) 
 
+        # Swipe-движок для переходов главная <-> подстраницы (OxygenOS push/pop)
+        self._page_swipe = PageSwipe(self.stacked_pages)
+        self._row_press_anims = {}
+
         # Ссылки на QLabels для версии системы и кнопку обновления
         self.system_version_label_value = QLabel(self._system_version) 
         self.check_for_updates_button = QPushButton() 
@@ -620,9 +690,9 @@ class SettingsContent(QFrame):
 
         # Группы настроек
         self._add_settings_group("General", [ 
-            self._create_setting_row("Language & Region", lambda: self.stacked_pages.setCurrentWidget(self.language_page)), 
-            self._create_setting_row("Navigation Mode", lambda: self.stacked_pages.setCurrentWidget(self.navigation_page)), 
-            self._create_setting_row("Launcher Settings", lambda: self.stacked_pages.setCurrentWidget(self.launcher_settings_page)), 
+            self._create_setting_row("Language & Region", lambda: self._push_subpage(self.language_page)), 
+            self._create_setting_row("Navigation Mode", lambda: self._push_subpage(self.navigation_page)), 
+            self._create_setting_row("Launcher Settings", lambda: self._push_subpage(self.launcher_settings_page)), 
         ])
         
         self._add_settings_group("About", [ 
@@ -667,10 +737,29 @@ class SettingsContent(QFrame):
         self.launcher_settings_page.app_names_visibility_changed.connect(self.launcher_app_names_visibility_changed.emit)
 
 
+    def _push_subpage(self, page):
+        """Открытие подстраницы — OxygenOS push: новая страница въезжает справа."""
+        if self.stacked_pages.currentWidget() is page:
+            return
+        if page is self.language_page:
+            self._show_language_settings_data()
+        elif page is self.navigation_page:
+            self._show_navigation_settings_data()
+        elif page is self.launcher_settings_page:
+            self.launcher_settings_page.update_localization(self._language)
+        self._page_swipe.transition_to(page, direction="forward", duration=Duration.SHORT + 80)
+
+    def _pop_to_main(self):
+        """Возврат на главную — pop: подстраница уезжает вправо, главная выезжает слева."""
+        if self.stacked_pages.currentWidget() is self.main_settings_page:
+            return
+        self._update_localization()
+        self._page_swipe.transition_to(self.main_settings_page, direction="backward",
+                                       duration=Duration.SHORT + 80)
+
     def _show_main_settings_page(self):
-        """Переключает на главную страницу настроек."""
-        self.stacked_pages.setCurrentWidget(self.main_settings_page)
-        self._update_localization() # Обновляем тексты на главной странице после возвращения
+        """Переключает на главную страницу настроек (с анимацией pop)."""
+        self._pop_to_main()
 
     def _on_language_selected_from_subpage(self, new_language: str):
         """Обрабатывает выбор языка на подстранице."""
@@ -695,13 +784,18 @@ class SettingsContent(QFrame):
             self.scroll_content_layout.addWidget(row_widget)
 
     def _create_setting_row(self, text_key: str, action):
-        row_widget = QWidget()
+        row_widget = PressableRow()
         row_layout = QHBoxLayout(row_widget)
         row_layout.setContentsMargins(0, 0, 0, 0)
         row_layout.setSpacing(10)
+        # OxygenOS-style: лёгкое затемнение строки при нажатии + отклик scale
+        row_widget.setStyleSheet("""
+            PressableRow { background-color: transparent; border-radius: 12px; }
+            PressableRow:hover { background-color: rgba(255,255,255,0.04); }
+        """)
 
         label = QLabel(self.localized_texts.get(self._language, {}).get(text_key, text_key))
-        label.setStyleSheet("font-size: 16px; color: white;")
+        label.setStyleSheet("font-size: 16px; color: white; background: transparent;")
         row_layout.addWidget(label)
         row_layout.addStretch(1)
 
@@ -771,23 +865,25 @@ class SettingsContent(QFrame):
         return row_widget
 
 
-    def _show_language_settings(self):
+    def _show_language_settings_data(self):
         self.language_page._current_language = self._language 
         self.language_page.language_combo.setCurrentText(self._language) 
-        self.language_page.update_localization(self._language) 
-        self.stacked_pages.setCurrentWidget(self.language_page)
+        self.language_page.update_localization(self._language)
 
-
-    def _show_navigation_settings(self):
+    def _show_navigation_settings_data(self):
         self.navigation_page._selected_navigation_mode = self._current_navigation_mode 
         self.navigation_page.three_button_radio.setChecked(self._current_navigation_mode == NAVIGATION_MODE_THREE_BUTTON)
-        self.navigation_page.update_localization(self._language) 
-        self.stacked_pages.setCurrentWidget(self.navigation_page)
+        self.navigation_page.update_localization(self._language)
+
+    def _show_language_settings(self):
+        self._push_subpage(self.language_page)
+
+    def _show_navigation_settings(self):
+        self._push_subpage(self.navigation_page)
 
     def _show_launcher_settings(self):
         """Переключает на страницу настроек лаунчера."""
-        self.launcher_settings_page.update_localization(self._language)
-        self.stacked_pages.setCurrentWidget(self.launcher_settings_page)
+        self._push_subpage(self.launcher_settings_page)
 
 
     def _check_for_updates(self):

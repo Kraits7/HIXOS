@@ -7,7 +7,13 @@ from PyQt5.QtWidgets import (
     QGraphicsOpacityEffect, QRadioButton, QMessageBox
 )
 from PyQt5.QtGui import QPixmap, QTransform, QColor
-from PyQt5.QtCore import Qt, QTimer, QSize, pyqtSignal, QTime, QPropertyAnimation, QEasingCurve, QRect, QParallelAnimationGroup, QEvent, QDate
+from PyQt5.QtCore import Qt, QTimer, QSize, pyqtSignal, QTime, QPropertyAnimation, QEasingCurve, QRect, QPoint, QParallelAnimationGroup, QEvent, QDate
+
+# --- Системный движок анимаций (OxygenOS / iOS style) ---
+try:
+    from ui.animation_engine import Easing, Duration, PageSwipe, MorphOverlay
+except ImportError:
+    from animation_engine import Easing, Duration, PageSwipe, MorphOverlay
 
 import os
 import json # Import for JSON parsing
@@ -319,6 +325,10 @@ class MainWindow(QMainWindow):
         self.stacked_widget.addWidget(self.browser_page) 
         self.stacked_widget.addWidget(self.settings_page)
 
+        # Движок swipe-переходов между страницами (OxygenOS shifting pages)
+        self.page_swipe = PageSwipe(self.stacked_widget)
+        self._closing_morph = None
+
         self.setFocusPolicy(Qt.StrongFocus)
 
         self.setup_connections()
@@ -463,23 +473,44 @@ class MainWindow(QMainWindow):
     def _on_lock_screen_unlocked(self):
         """
         Called when the lock screen is unlocked.
-        Starts the animation to fade out the lock screen and reveal the launcher.
+        iOS-style unlock: локскрин не просто гаснет — он параллельно уезжает
+        вверх (slide-up) и затухает, открывая рабочий стол.
         """
         self.power_state = self.UNLOCKED
         print(f"Screen unlocked. Starting animation and transitioning to launcher for user: {self.current_username}.")
 
+        # Готовим лаунчер заранее, но показываем его ПОД локскрином сразу,
+        # чтобы transition был непрерывным (как в iOS).
+        self.launcher_page.prepare_for_animation()
+        self.stacked_widget.setCurrentIndex(self.stacked_widget.indexOf(self.launcher_page))
+        self.launcher_page.show()
+        self.launcher_page.lower()
+        self.lock_screen_page.raise_()
+        self.lock_screen_page.show()
+
         opacity_effect = QGraphicsOpacityEffect(self.lock_screen_page)
         self.lock_screen_page.setGraphicsEffect(opacity_effect)
 
-        lock_screen_fade_out_animation = QPropertyAnimation(opacity_effect, b"opacity")
-        lock_screen_fade_out_animation.setDuration(300) 
+        base_pos = self.lock_screen_page.pos()
+
+        lock_screen_fade_out_animation = QPropertyAnimation(opacity_effect, b"opacity", self.lock_screen_page)
+        lock_screen_fade_out_animation.setDuration(Duration.TRANSITION)
         lock_screen_fade_out_animation.setStartValue(1.0)
         lock_screen_fade_out_animation.setEndValue(0.0)
-        lock_screen_fade_out_animation.setEasingCurve(QEasingCurve.OutQuad)
+        lock_screen_fade_out_animation.setEasingCurve(Easing.IOS_TRANSITION)
 
-        lock_screen_fade_out_animation.finished.connect(self._start_launcher_animation)
-        
-        lock_screen_fade_out_animation.start()
+        slide_up = QPropertyAnimation(self.lock_screen_page, b"pos", self.lock_screen_page)
+        slide_up.setDuration(Duration.TRANSITION)
+        slide_up.setStartValue(base_pos)
+        slide_up.setEndValue(base_pos + QPoint(0, -int(self.height() * 0.18)))
+        slide_up.setEasingCurve(Easing.IOS_TRANSITION)
+
+        group = QParallelAnimationGroup(self)
+        group.addAnimation(lock_screen_fade_out_animation)
+        group.addAnimation(slide_up)
+        group.finished.connect(self._start_launcher_animation)
+        self._unlock_group = group
+        group.start(QParallelAnimationGroup.DeleteWhenStopped)
 
     def _start_launcher_animation(self):
         """
@@ -509,22 +540,82 @@ class MainWindow(QMainWindow):
 
     def show_launcher_page(self, selected_language: str): # Добавлен тип для selected_language
         self.power_state = self.UNLOCKED
-        self.launcher_page.show() 
         self.current_language = selected_language
-        self.launcher_page.set_language(selected_language) 
-        self.stacked_widget.setCurrentIndex(self.stacked_widget.indexOf(self.launcher_page))
-        self.status_bar_widget.set_is_light_background(False)
-        self.setFocusProxy(self.launcher_page)
-        self.last_unlocked_page = self.launcher_page 
+        self.launcher_page.set_language(selected_language)
+        self._return_to_launcher(animate=True)
         
 
     def show_launcher_page_without_animation_prep(self):
         self.power_state = self.UNLOCKED
-        self.launcher_page.show() 
+        self._return_to_launcher(animate=False)
+
+    def _return_to_launcher(self, animate: bool = True):
+        """Возврат на рабочий стол. Если текущая страница — приложение,
+        сначала проигрываем morph-сворачивание окна в его иконку (iOS dismiss),
+        затем показываем лаунчер с волновым появлением иконок."""
+        current = self.stacked_widget.currentWidget()
+        is_app_page = (current is not None and current is not self.launcher_page
+                       and current is not self.lock_screen_page
+                       and current is not self.setup_page
+                       and current is not self.boot_page)
+
+        if animate and is_app_page:
+            self._play_closing_morph(current)
+            return
+
+        self.launcher_page.show()
         self.stacked_widget.setCurrentIndex(self.stacked_widget.indexOf(self.launcher_page))
+        if animate:
+            # волна иконок при возврате из приложения — как в OxygenOS
+            self.launcher_page.prepare_for_animation()
         self.status_bar_widget.set_is_light_background(False)
         self.setFocusProxy(self.launcher_page)
-        self.last_unlocked_page = self.launcher_page 
+        self.last_unlocked_page = self.launcher_page
+
+    def _play_closing_morph(self, app_page):
+        """iOS-style dismiss: окно приложения сворачивается в иконку на доке/сетке."""
+        icon = None
+        for ic in self.launcher_page.grid_app_icons + self.launcher_page.dock_app_icons:
+            page_for_id = {
+                "Phone": self.app1_page, "Messages": self.app2_page, "Camera": self.camera_page,
+                "Calculator": self.calculator_page, "Browser": self.browser_page,
+                "Settings": self.settings_page,
+            }.get(ic.app_id)
+            if page_for_id is app_page:
+                icon = ic
+                break
+        if icon is None:
+            # нет подходящей иконки — простой fade-scale выход страницы
+            self.page_swipe.transition_to(self.launcher_page, direction="backward",
+                                          duration=Duration.TRANSITION,
+                                          on_finished=lambda: self.launcher_page.animate_icons_in())
+            self.launcher_page.show()
+            self.status_bar_widget.set_is_light_background(False)
+            self.setFocusProxy(self.launcher_page)
+            self.last_unlocked_page = self.launcher_page
+            return
+
+        global_tl = icon.mapToGlobal(icon.rect().topLeft())
+        icon_rect = QRect(global_tl, icon.rect().size())
+        root = self
+        target_rect = QRect(root.rect().topLeft(), root.size())
+        morph = MorphOverlay(root, icon_rect, target_rect,
+                             pixmap=icon._original_pixmap, corner_start=0, corner_end=22)
+        self._closing_morph = morph
+
+        # саму страницу скрываем сразу под оверлеем — морф дорисует иллюзию
+        app_page.hide()
+
+        def done():
+            self._closing_morph = None
+            self.launcher_page.show()
+            self.stacked_widget.setCurrentIndex(self.stacked_widget.indexOf(self.launcher_page))
+            self.launcher_page.prepare_for_animation()
+            self.status_bar_widget.set_is_light_background(False)
+            self.setFocusProxy(self.launcher_page)
+            self.last_unlocked_page = self.launcher_page
+
+        morph.run_close(duration=Duration.DISMISS, curve=Easing.STANDARD, on_finished=done)
 
 
     def show_app_page(self, app_id: str, icon_rect: QRect): 
@@ -577,11 +668,23 @@ class MainWindow(QMainWindow):
             if self.stacked_widget.indexOf(target_page) == -1:
                 self.stacked_widget.addWidget(target_page)
 
-            self.stacked_widget.setCurrentWidget(target_page)
-            
-            target_page.show() 
+            # Если морф-оверлей от лаунчера ещё жив (морфинг иконки в экран),
+            # просто переключаем страницу под ним — без двойной анимации.
+            morph_alive = (getattr(self.launcher_page, "_morph", None) is not None)
 
-            target_page.setGraphicsEffect(None) 
+            self.stacked_widget.setCurrentWidget(target_page)
+            target_page.show()
+            target_page.setGraphicsEffect(None)
+            # Поднимаем живой морф над страницей приложения, чтобы анимация
+            # разворота оставалась поверх до последнего кадра.
+            if morph_alive and getattr(self.launcher_page, "_morph", None) is not None:
+                self.launcher_page._morph.raise_()
+
+            if not morph_alive:
+                # Прямое открытие (не из лаунчера): iOS-style fade+scale вход
+                from ui.animation_engine import PageTransition
+                pt = PageTransition(self.stacked_widget)
+                pt.fade_scale_in(target_page, start_scale=0.96, duration=Duration.TRANSITION)
 
             self.status_bar_widget.set_is_light_background(is_light_bg)
             self.setFocusProxy(target_page) 

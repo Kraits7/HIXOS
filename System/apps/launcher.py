@@ -478,17 +478,35 @@ class LauncherContent(QFrame):
         self._morph = MorphOverlay(root, icon_rect, target_rect, pixmap=pixmap,
                                    corner_start=22, corner_end=0)
 
-        # 2) Параллельно: сетка и док слегка уменьшаются и уходят в fade
-        #    (precise deceleration), а не просто гаснут по очереди.
-        opacity_effect = QGraphicsOpacityEffect(self)
-        self.setGraphicsEffect(opacity_effect)
-        self._hide_fade = QPropertyAnimation(opacity_effect, b"opacity", self)
-        self._hide_fade.setDuration(Duration.LAUNCH - 80)
-        self._hide_fade.setStartValue(1.0)
-        self._hide_fade.setEndValue(0.0)
-        self._hide_fade.setEasingCurve(Easing.ACCELERATE)
-        self._hide_fade.finished.connect(self._on_outgoing_animation_finished)
-        self._hide_fade.start()
+        # 2) Параллельно: лаунчер слегка уменьшается и уходит в fade
+        #    (precise deceleration), как домашний экран при zoom-переходе iOS.
+        #    QGraphicsOpacityEffect наследуется дочерними виджетами, поэтому
+        #    scale+fade вешаются на сам лаунчер ОДНИМ драйвером — без конфликта
+        #    с per-icon opacity во время волны появления.
+        if hasattr(self, "_stagger"):
+            self._stagger.stop_all()
+        for icon in self.grid_app_icons + self.dock_app_icons:
+            icon._opacity = 1.0
+            icon._scale_factor = 1.0
+            icon.update()
+        eff = QGraphicsOpacityEffect(self)
+        self.setGraphicsEffect(eff)
+        base_size = self.size()
+        base_pos = self.pos()
+
+        def launch_out_frame(p):
+            eff.setOpacity(1.0 - p)
+            s = 1.0 - 0.06 * p
+            w = max(1, int(base_size.width() * s))
+            h = max(1, int(base_size.height() * s))
+            self.setGeometry(base_pos.x() + (base_size.width() - w) // 2,
+                             base_pos.y() + (base_size.height() - h) // 2,
+                             w, h)
+
+        self._launch_out_driver = _FrameDriver(
+            Duration.LAUNCH, Easing.ACCELERATE, launch_out_frame,
+            on_finished=self._on_outgoing_animation_finished, parent=self)
+        self._launch_out_driver.start()
 
         # 3) Пружинный отклик самой иконки при нажатии уже обработан в AppIcon.
         #    Морф перекрывает экран до самого открытия приложения: сигнал
@@ -506,6 +524,16 @@ class LauncherContent(QFrame):
         Эмитирует сигнал для MainWindow для запуска приложения.
         """
         self.setGraphicsEffect(None)
+        if getattr(self, "_hide_fade", None) is not None:
+            try:
+                self._hide_fade.stop()
+            except Exception:
+                pass
+            self._hide_fade = None
+        if getattr(self, "_launch_out_driver", None) is not None:
+            self._launch_out_driver.stop()
+            self._launch_out_driver = None
+        self.setGeometry(self.parent().geometry()) if self.parent() else None
 
         self.hide()
 
@@ -532,13 +560,21 @@ class LauncherContent(QFrame):
 
         if not hasattr(self, "_stagger"):
             self._stagger = StaggerReveal(self)
+        self._stagger.cancel()  # сбрасываем _cancelled и старые драйверы
 
         columns = max(1, self._current_grid_columns)
+        stagger = self._stagger
 
         def apply_fn(widget, p):
             # p уже прошёл easing (STANDARD). Лёгкий overshoot масштаба — spring feel.
             widget.set_scale(0.6 + 0.4 * p)
             widget.opacity = min(1.0, p * 1.8)
+
+        def schedule(ms, driver):
+            def _try_start():
+                if not getattr(stagger, "_cancelled", False):
+                    driver.start()
+            QTimer.singleShot(ms, _try_start)
 
         # Диагональная волна: задержка каждой иконки = (row+col)*STEP
         step = Duration.STAGGER_STEP
@@ -546,16 +582,16 @@ class LauncherContent(QFrame):
         for i, icon in enumerate(self.grid_app_icons):
             row, col = divmod(i, columns)
             d = _FrameDriver(Duration.STANDARD + 80, Easing.STANDARD,
-                             lambda p, w=icon: apply_fn(w, p), parent=self._stagger)
-            QTimer.singleShot(delay + (row + col) * step, d.start)
-            self._stagger._drivers.append(d)
+                             lambda p, w=icon: apply_fn(w, p), parent=stagger)
+            schedule(delay + (row + col) * step, d)
+            stagger._drivers.append(d)
 
         # Док появляется первым и быстрее (как в OxygenOS/iOS)
         for j, icon in enumerate(self.dock_app_icons):
             d = _FrameDriver(Duration.SHORT + 120, Easing.SPRING,
-                             lambda p, w=icon: apply_fn(w, p), parent=self._stagger)
-            QTimer.singleShot(20 + j * 30, d.start)
-            self._stagger._drivers.append(d)
+                             lambda p, w=icon: apply_fn(w, p), parent=stagger)
+            schedule(20 + j * 30, d)
+            stagger._drivers.append(d)
 
         # Приветствие — мягкий slide-down + fade
         greeting = getattr(self, "greeting_label", None)
@@ -571,9 +607,9 @@ class LauncherContent(QFrame):
 
             gd = _FrameDriver(Duration.STANDARD, Easing.DECELERATE, g_apply,
                               on_finished=lambda: greeting.setGraphicsEffect(None),
-                              parent=self._stagger)
-            QTimer.singleShot(0, gd.start)
-            self._stagger._drivers.append(gd)
+                              parent=stagger)
+            schedule(0, gd)
+            stagger._drivers.append(gd)
 
     def showEvent(self, event):
         """

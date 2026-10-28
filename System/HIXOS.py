@@ -37,6 +37,12 @@ from apps.camera import CameraContent # Import CameraContent
 # IMPORT NavigationBarWidget
 from ui.navigation_bar import NavigationBarWidget, NAVIGATION_MODE_THREE_BUTTON, NAVIGATION_MODE_GESTURES
 
+# Экран недавних приложений (iOS App Switcher)
+try:
+    from ui.recents import RecentsOverlay
+except ImportError:
+    from recents import RecentsOverlay
+
 
 # --- GLOBAL SETTINGS ---
 APP_WIDTH = 519
@@ -596,6 +602,13 @@ class MainWindow(QMainWindow):
         self.page_swipe = PageSwipe(self.stacked_widget)
         self._closing_morph = None
 
+        # --- Recents (недавние приложения, iOS App Switcher) ---
+        # Стек сессий: [{"app_id", "page", "snapshot"}] — вершина = последняя.
+        self.recents_stack = []
+        self._recents_overlay = None
+        self._oobe_blocked_toast = None
+        self._final_launch_driver = None
+
         self.setFocusPolicy(Qt.StrongFocus)
 
         self.setup_connections()
@@ -950,6 +963,8 @@ class MainWindow(QMainWindow):
 
         def done():
             self._reveal_launcher_after_dismiss()
+            # приложение свёрнуто — обновляем его живой снимок в недавних
+            self._record_session(app_page)
 
         # run_close идёт от прогресса 1->0, но у нас семантика та же:
         # экран -> иконка. Углы: 0 (экран) -> 22 (иконка) уже в параметрах.
@@ -1034,6 +1049,9 @@ class MainWindow(QMainWindow):
             self.stacked_widget.setCurrentWidget(target_page)
             target_page.show()
             target_page.setGraphicsEffect(None)
+            # фиксируем сессию в недавних (снимок до morph-перекрытия надёжнее
+            # делать здесь — страница уже отрисована)
+            self._record_session(target_page)
             # Поднимаем живой морф над страницей приложения, чтобы анимация
             # разворота оставалась поверх до последнего кадра.
             if morph_alive and getattr(self.launcher_page, "_morph", None) is not None:
@@ -1057,6 +1075,216 @@ class MainWindow(QMainWindow):
         print(f"System language set to: {self.current_language} (not saved).")
         self.show_launcher_page(language)
 
+    def _is_oobe_active(self):
+        """OOBE активен, если страница настройки показана и ещё не завершена."""
+        if self.stacked_widget.currentWidget() is not getattr(self, "setup_page", None):
+            return False
+        return not getattr(self.setup_page, "_finished", False)
+
+    def _show_oobe_blocked_toast(self):
+        """Мягкий iOS-алерт: нельзя выйти из настройки, пока она не завершена."""
+        try:
+            from ui.recents import DelayedFrameDriver  # тот же покадровый движок
+        except ImportError:
+            from recents import DelayedFrameDriver
+
+        old_pair = self._oobe_blocked_toast
+        if old_pair is not None:
+            try:
+                old_pair[0].deleteLater()
+            except RuntimeError:
+                pass
+            self._oobe_blocked_toast = None
+
+        toast = QLabel("Пройдите настройку до конца", self.central_container_widget)
+        toast.setAlignment(Qt.AlignCenter)
+        toast.setWordWrap(False)
+        f = QFont()
+        f.setPixelSize(13)
+        f.setWeight(QFont.DemiBold)
+        toast.setFont(f)
+        fm_w = toast.fontMetrics().width(toast.text())
+        tw = min(max(fm_w + 40, 200), self.width() - 40)
+        th = 36
+        start_y = int(self.height() * 0.72)
+        end_y = start_y - 12
+        toast.setGeometry((self.width() - tw) // 2, start_y, tw, th)
+        toast.setStyleSheet(
+            "QLabel{background-color: rgba(48,52,62,0.94); color: white;"
+            "border-radius: 18px; border: 1px solid rgba(255,255,255,0.14);}")
+        toast.setAttribute(Qt.WA_TransparentForMouseEvents)
+        effect = QGraphicsOpacityEffect(toast)
+        toast.setGraphicsEffect(effect)
+        effect.setOpacity(0.0)
+        toast.show()
+        toast.raise_()
+        self._oobe_blocked_toast = (toast, effect)
+
+        def frame(p):
+            if p < 0.28:
+                e = spring_progress(p / 0.28)
+            else:
+                fade = max(0.0, (p - 0.72) / 0.28)
+                e = 1.0 - fade
+            effect.setOpacity(min(1.0, max(0.0, e * 1.0)))
+            y = int(start_y + (end_y - start_y) * min(1.0, p / 0.28)) \
+                if p < 0.72 else start_y
+            toast.move((self.width() - tw) // 2, y)
+
+        def done():
+            if self._oobe_blocked_toast and self._oobe_blocked_toast[0] is toast:
+                self._oobe_blocked_toast = None
+            toast.deleteLater()
+
+        driver = DelayedFrameDriver(0, 1500, QEasingCurve.Linear, frame, done, parent=self)
+        driver.start()
+
+    def _on_nav_back(self):
+        """Кнопка «Назад» трёхкнопочной навигации (жестов нет — только кнопки)."""
+        if self.power_state == self.BOOTING:
+            return
+        if self._recents_overlay is not None and self._recents_overlay.isVisible():
+            self._recents_overlay.play_dismiss_anim()
+            return
+        if self._is_oobe_active():
+            # В OOBE системная «назад» не работает — подсказка пройти настройку
+            self._show_oobe_blocked_toast()
+            return
+        if self.power_state == self.LOCKED:
+            return
+        current = self.stacked_widget.currentWidget()
+        if current is self.launcher_page:
+            return  # уже дома
+        if current in (self.app1_page, self.app2_page, self.camera_page,
+                       self.calculator_page, self.browser_page, self.settings_page) or \
+           current.property("hixos_placeholder_app") is not None:
+            self.show_launcher_page(self.current_language)
+        else:
+            self.show_launcher_page(self.current_language)
+
+    def _on_nav_recents(self):
+        """Кнопка «Недавние»: открывает App Switcher (только кнопки, без жестов)."""
+        if self.power_state == self.BOOTING:
+            return
+        if self._is_oobe_active():
+            self._show_oobe_blocked_toast()
+            return
+        if self.power_state == self.LOCKED:
+            return
+        self._open_recents()
+
+    # ------------------------------------------------------------------
+    # RECENTS (iOS App Switcher)
+    # ------------------------------------------------------------------
+    def _app_pages(self):
+        return [self.app1_page, self.app2_page, self.camera_page,
+                self.calculator_page, self.browser_page, self.settings_page]
+
+    def _display_name_for_app(self, app_id):
+        locale = getattr(self.launcher_page, "localized_app_names", {})
+        cur = locale.get(self.current_language, locale.get("Русский", {}))
+        rus = locale.get("Русский", {})
+        return cur.get(app_id, rus.get(app_id, app_id))
+
+    def _record_session(self, app_page):
+        """Снимок страницы в стек недавних (вершина стека = последняя)."""
+        app_id = app_page.property("hixos_placeholder_app")
+        if app_id is None:
+            known = {id(self.app1_page): "Phone", id(self.app2_page): "Messages",
+                     id(self.camera_page): "Camera", id(self.calculator_page): "Calculator",
+                     id(self.browser_page): "Browser", id(self.settings_page): "Settings"}
+            app_id = known.get(id(app_page))
+        if app_id is None:
+            return
+        try:
+            snapshot = app_page.grab()
+        except Exception:
+            snapshot = None
+        # дедупликация: та же аппа уже на вершине — просто обновляем снимок
+        if self.recents_stack and self.recents_stack[-1]["app_id"] == app_id:
+            self.recents_stack[-1]["snapshot"] = snapshot
+            return
+        self.recents_stack.append({"app_id": app_id, "page": app_page, "snapshot": snapshot})
+        # iOS держит ограниченное число карточек
+        MAX_RECENTS = 8
+        if len(self.recents_stack) > MAX_RECENTS:
+            self.recents_stack = self.recents_stack[-MAX_RECENTS:]
+
+    def _clear_session(self, app_page):
+        self.recents_stack = [s for s in self.recents_stack if s["page"] is not app_page]
+
+    def _open_recents(self):
+        overlay = self._ensure_recents_overlay()
+        sessions = []
+        for s in reversed(self.recents_stack):  # последние сверху
+            icon_pix = None
+            ic = self._find_icon_by_app_id(s["app_id"])
+            if ic is not None:
+                icon_pix = ic._original_pixmap
+            sessions.append({
+                "app_id": s["app_id"],
+                "name": self._display_name_for_app(s["app_id"]),
+                "icon": icon_pix,
+                "snapshot": s.get("snapshot"),
+            })
+        overlay.set_sessions(sessions)
+        overlay.play_show_anim()
+        # фон под оверлеем: если сейчас лаунчер — оставить, иначе прикроем стекло
+
+    def _find_icon_by_app_id(self, app_id):
+        for ic in self.launcher_page.grid_app_icons + self.launcher_page.dock_app_icons:
+            if ic.app_id == app_id:
+                return ic
+        return None
+
+    def _ensure_recents_overlay(self):
+        if self._recents_overlay is None:
+            self._recents_overlay = RecentsOverlay(self.central_container_widget)
+            self._recents_overlay.setGeometry(self.central_container_widget.rect())
+            self._recents_overlay.app_resumed.connect(self._resume_from_recents)
+        else:
+            self._recents_overlay.setGeometry(self.central_container_widget.rect())
+        return self._recents_overlay
+
+    def _resume_from_recents(self, app_id):
+        target = None
+        for s in self.recents_stack:
+            if s["app_id"] == app_id:
+                target = s["page"]
+                break
+        if target is None:
+            return
+        current = self.stacked_widget.currentWidget()
+        if current is target:
+            return
+        if current is self.launcher_page:
+            # разворот из иконки (morph open) — как обычный запуск
+            ic = self._find_icon_by_app_id(app_id)
+            if ic is not None:
+                root = self
+                g_tl = ic.mapToGlobal(ic.rect().topLeft())
+                icon_local = QRect(root.mapFromGlobal(g_tl), ic.rect().size())
+                shot = target.grab()
+                morph = MorphOverlay(root, icon_local, QRect(QPoint(0, 0), self.stacked_widget.size()),
+                                     pixmap=ic._original_pixmap, corner_start=22, corner_end=0,
+                                     snapshot=shot, rects_local=True)
+                morph.run_open(duration=Duration.LAUNCH, curve=Easing.STANDARD,
+                               on_finished=lambda t=target: self._finish_resume(t))
+                self.stacked_widget.setCurrentWidget(target)
+                target.show()
+                morph.raise_()
+                return
+        self.stacked_widget.setCurrentWidget(target)
+        target.show()
+        self.setFocusProxy(target)
+        self.last_unlocked_page = target
+        self._set_bars_ink(target is self.browser_page)
+
+    def _finish_resume(self, target):
+        self.setFocusProxy(target)
+        self.last_unlocked_page = target
+        self._set_bars_ink(target is self.browser_page)
+
     def finalize_oobe_setup(self, language: str, navigation_mode: str, username: str):
         self.current_language = language
         self.current_navigation_mode = navigation_mode
@@ -1066,11 +1294,28 @@ class MainWindow(QMainWindow):
         print(f"OOBE completed (data not saved). System language: {self.current_language}, navigation mode: {self.current_navigation_mode}, username: {self.current_username}.")
         
         self.navigation_bar.set_navigation_mode(self.current_navigation_mode)
-        
+
+        # OOBE завершён — выход из настройки больше не блокируется
+        self.setup_page._finished = True
+
         # Prepare the launcher for animation
         self.launcher_page.prepare_for_animation()
+        self.launcher_page.show()
+        self.stacked_widget.setCurrentIndex(self.stacked_widget.indexOf(self.launcher_page))
+        self._set_bars_ink(False)
+        self.setFocusProxy(self.launcher_page)
+        self.last_unlocked_page = self.launcher_page
 
-        self.show_launcher_page(language)
+        # Волна появления иконок расходится ОТ кнопки «Начать работу»
+        origin = None
+        try:
+            btn = self.setup_page.final_page.findChild(QPushButton, "primaryButton")
+            if btn is not None and btn.isVisible():
+                g_c = btn.mapToGlobal(btn.rect().center())
+                origin = QPointF(self.central_container_widget.mapFromGlobal(g_c))
+        except RuntimeError:
+            origin = None
+        self.launcher_page.animate_icons_in(origin=origin)
         
     def load_user_preferences(self):
         pass 

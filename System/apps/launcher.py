@@ -586,19 +586,23 @@ class LauncherContent(QFrame):
         elif getattr(self, "_morph", None) is not None:
             pass  # ждём on_finished морфа — там произойдёт emit
 
-    def animate_icons_in(self):
+    def animate_icons_in(self, origin=None):
         """
         Появление иконок в стиле iOS/MIUI: они НЕ «волной» — каждая иконка
         ПРИЛЕТАЕТ снизу вверх с spring-оседанием (overshoot) и лёгким
         масштабным pop'ом. Единый frame-драйвер на всю сетку (60 FPS),
         stagger — маленькая диагональная задержка, чтобы выглядело как
         «россыпь прилетевших плиток», а не как последовательная волна.
+
+        origin (QPointF|None): если задан — задержка каждой иконки считается
+        по расстоянию от этой точки (волна расходится ОТ неё), например от
+        кнопки «Начать работу» в конце OOBE.
         """
         all_icons = self.grid_app_icons + self.dock_app_icons
 
         # Дожидаемся реальной раскладки (grid может быть ещё не отложен)
         if not all_icons or all(i.height() <= 0 for i in all_icons):
-            QTimer.singleShot(0, self.animate_icons_in)
+            QTimer.singleShot(0, lambda: self.animate_icons_in(origin))
             return
 
         # Сброс: спрятанные, но НЕ уменьшенные в 0 (прилёт делает свой scale)

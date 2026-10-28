@@ -7,13 +7,17 @@ from PyQt5.QtWidgets import (
     QGraphicsOpacityEffect
 )
 from PyQt5.QtGui import QPixmap, QFont, QColor, QBrush, QPainter, QLinearGradient
-from PyQt5.QtCore import Qt, pyqtSignal, QSize, QPoint, QPropertyAnimation, QEasingCurve, QRect, pyqtProperty, QParallelAnimationGroup, QSequentialAnimationGroup, QTimer, QPauseAnimation
+from PyQt5.QtCore import Qt, pyqtSignal, QObject, QSize, QPoint, QPropertyAnimation, QEasingCurve, QRect, pyqtProperty, QParallelAnimationGroup, QSequentialAnimationGroup, QTimer, QPauseAnimation
 
 # --- Системный движок анимаций (OxygenOS / iOS style) ---
 try:
-    from ui.animation_engine import Easing, Duration, animate, _FrameDriver
+    from ui.animation_engine import (
+        Easing, Duration, animate, _FrameDriver, MorphOverlay, StaggerReveal,
+    )
 except ImportError:  # запуск лаунчера standalone из папки apps
-    from animation_engine import Easing, Duration, animate, _FrameDriver
+    from animation_engine import (
+        Easing, Duration, animate, _FrameDriver, MorphOverlay, StaggerReveal,
+    )
 
 
 class SpringScaleAnimator(QObject):
@@ -451,79 +455,125 @@ class LauncherContent(QFrame):
     def _handle_app_icon_pressed(self, app_id: str, icon_rect: QRect):
         """
         Обрабатывает нажатие на иконку приложения.
-        Запускает анимацию скрытия лаунчера и затем инициирует запуск приложения.
+        iOS/OxygenOS-style: параллельно запускаем morph-разворот иконки в экран
+        и мягкое затухание сетки дока/лаунчера; по окончании морфа эмитируем
+        сигнал запуска приложения (окно появляется уже «под» анимацией).
         """
         self.current_app_id_to_launch = app_id
         self.current_icon_rect_for_animation = icon_rect
 
-        # Создаем новый QGraphicsOpacityEffect каждый раз.
-        opacity_effect = QGraphicsOpacityEffect(self)
-        self.setGraphicsEffect(opacity_effect) 
+        # 1) Морф-оверлей рисуем на корне окна (над статусбаром/доком), чтобы
+        #    разворачивающаяся иконка перекрывала весь рабочий стол — как zoom
+        #    transition в iOS.
+        root = self.window()
+        target_rect = QRect(root.rect().topLeft(), root.size()) if root else QRect(icon_rect)
+        src_icon = None
+        for ic in self.grid_app_icons + self.dock_app_icons:
+            if ic.app_id == app_id:
+                src_icon = ic
+                break
+        pixmap = src_icon._original_pixmap if src_icon else None
 
-        self.hide_animation = QPropertyAnimation(opacity_effect, b"opacity") 
-        self.hide_animation.setDuration(250) 
-        self.hide_animation.setStartValue(1.0)
-        self.hide_animation.setEndValue(0.0)
-        self.hide_animation.setEasingCurve(QEasingCurve.OutQuad)
-        
-        self.hide_animation.finished.connect(self._on_outgoing_animation_finished)
-        
-        self.hide_animation.start()
+        self._morph_pending = False
+        self._morph = MorphOverlay(root, icon_rect, target_rect, pixmap=pixmap,
+                                   corner_start=22, corner_end=0)
+
+        # 2) Параллельно: сетка и док слегка уменьшаются и уходят в fade
+        #    (precise deceleration), а не просто гаснут по очереди.
+        opacity_effect = QGraphicsOpacityEffect(self)
+        self.setGraphicsEffect(opacity_effect)
+        self._hide_fade = QPropertyAnimation(opacity_effect, b"opacity", self)
+        self._hide_fade.setDuration(Duration.LAUNCH - 80)
+        self._hide_fade.setStartValue(1.0)
+        self._hide_fade.setEndValue(0.0)
+        self._hide_fade.setEasingCurve(Easing.ACCELERATE)
+        self._hide_fade.finished.connect(self._on_outgoing_animation_finished)
+        self._hide_fade.start()
+
+        # 3) Пружинный отклик самой иконки при нажатии уже обработан в AppIcon.
+        #    Морф перекрывает экран до самого открытия приложения: сигнал
+        #    запуска эмитим на последнем кадре — переход выглядит непрерывным.
+        def _emit_launch():
+            self._morph_pending = True
+            self._on_outgoing_animation_finished()
+
+        self._morph.run_open(duration=Duration.LAUNCH, curve=Easing.STANDARD,
+                             on_finished=_emit_launch)
 
     def _on_outgoing_animation_finished(self):
         """
         Вызывается после завершения анимации скрытия лаунчера.
         Эмитирует сигнал для MainWindow для запуска приложения.
         """
-        self.setGraphicsEffect(None) 
+        self.setGraphicsEffect(None)
 
-        self.hide() 
-        
-        self.launch_app_requested.emit(self.current_app_id_to_launch, self.current_icon_rect_for_animation)
+        self.hide()
+
+        # Эмитируем запуск только когда морф дошёл до конца (или fade завершился
+        # раньше — тогда морф дорабатываем сами и скрываем под открытым экраном).
+        if getattr(self, "_morph_pending", False):
+            self._morph_pending = False
+            self.launch_app_requested.emit(self.current_app_id_to_launch,
+                                           self.current_icon_rect_for_animation)
+        elif getattr(self, "_morph", None) is not None:
+            pass  # ждём on_finished морфа — там произойдёт emit
 
     def animate_icons_in(self):
         """
-        Запускает анимацию появления иконок (масштабирование и прозрачность)
-        после разблокировки.
+        Волновое (staggered) появление иконок в стиле OxygenOS:
+        единый diagonal wave — scale spring + fade с нарастающей задержкой
+        по row+col, никаких последовательных пауз на каждую иконку.
         """
         all_icons = self.grid_app_icons + self.dock_app_icons
-        
+
         # Сначала убедимся, что все иконки полностью скрыты для начала анимации
         for icon in all_icons:
             icon.reset_animation_state()
-        
-        animation_group = QParallelAnimationGroup(self)
-        
-        base_delay = 50 # Базовая задержка для каждой иконки
-        
-        for i, icon in enumerate(all_icons):
-            # Создаем последовательную группу для каждой иконки, чтобы сначала была задержка, затем анимация
-            sequential_icon_animation = QSequentialAnimationGroup(self)
 
-            # Добавляем паузу
-            pause_animation = QPauseAnimation(i * base_delay, self) # Задержка для каждой иконки
-            sequential_icon_animation.addAnimation(pause_animation)
+        if not hasattr(self, "_stagger"):
+            self._stagger = StaggerReveal(self)
 
-            # Анимация масштаба
-            scale_animation = QPropertyAnimation(icon, b"scale")
-            scale_animation.setDuration(400) # Длительность анимации масштаба
-            scale_animation.setStartValue(0.0) # Начинаем с невидимого размера
-            scale_animation.setEndValue(1.0) # Заканчиваем нормальным размером
-            scale_animation.setEasingCurve(QEasingCurve.OutBack) # Эффект "выпрыгивания"
-            sequential_icon_animation.addAnimation(scale_animation) # Добавляем к последовательной группе
+        columns = max(1, self._current_grid_columns)
 
-            # Анимация прозрачности
-            opacity_animation = QPropertyAnimation(icon, b"opacity")
-            opacity_animation.setDuration(300) # Длительность анимации прозрачности
-            opacity_animation.setStartValue(0.0) # Начинаем с прозрачного
-            opacity_animation.setEndValue(1.0) # Заканчиваем полностью видимым
-            opacity_animation.setEasingCurve(QEasingCurve.OutQuad)
-            sequential_icon_animation.addAnimation(opacity_animation) # Добавляем к последовательной группе
-            
-            # Добавляем последовательную анимацию иконки в параллельную группу
-            animation_group.addAnimation(sequential_icon_animation)
-            
-        animation_group.start()
+        def apply_fn(widget, p):
+            # p уже прошёл easing (STANDARD). Лёгкий overshoot масштаба — spring feel.
+            widget.set_scale(0.6 + 0.4 * p)
+            widget.opacity = min(1.0, p * 1.8)
+
+        # Диагональная волна: задержка каждой иконки = (row+col)*STEP
+        step = Duration.STAGGER_STEP
+        delay = 40
+        for i, icon in enumerate(self.grid_app_icons):
+            row, col = divmod(i, columns)
+            d = _FrameDriver(Duration.STANDARD + 80, Easing.STANDARD,
+                             lambda p, w=icon: apply_fn(w, p), parent=self._stagger)
+            QTimer.singleShot(delay + (row + col) * step, d.start)
+            self._stagger._drivers.append(d)
+
+        # Док появляется первым и быстрее (как в OxygenOS/iOS)
+        for j, icon in enumerate(self.dock_app_icons):
+            d = _FrameDriver(Duration.SHORT + 120, Easing.SPRING,
+                             lambda p, w=icon: apply_fn(w, p), parent=self._stagger)
+            QTimer.singleShot(20 + j * 30, d.start)
+            self._stagger._drivers.append(d)
+
+        # Приветствие — мягкий slide-down + fade
+        greeting = getattr(self, "greeting_label", None)
+        if greeting is not None:
+            from PyQt5.QtWidgets import QGraphicsOpacityEffect as _GOE
+            eff = _GOE(greeting)
+            greeting.setGraphicsEffect(eff)
+            base_y = greeting.y()
+
+            def g_apply(p):
+                eff.setOpacity(min(1.0, p * 1.4))
+                greeting.move(greeting.x(), int(base_y - 14 * (1.0 - p)))
+
+            gd = _FrameDriver(Duration.STANDARD, Easing.DECELERATE, g_apply,
+                              on_finished=lambda: greeting.setGraphicsEffect(None),
+                              parent=self._stagger)
+            QTimer.singleShot(0, gd.start)
+            self._stagger._drivers.append(gd)
 
     def showEvent(self, event):
         """

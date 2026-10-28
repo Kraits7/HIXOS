@@ -168,9 +168,17 @@ class MorphOverlay(QWidget):
         self.raise_()
         self._icon_rect = QRect(icon_rect)
         self._target_rect = QRect(target_rect)
-        # Переводим глобальные координаты иконки в координаты контейнера
+        # Координаты icon_rect — глобальные (mapToGlobal виджета): переводим
+        # их в систему координат контейнера. target_rect может быть как
+        # локальным (container.rect()), так и глобальным (координаты окна) —
+        # если он совпадает с geometry контейнера, берём локальный rect.
         tl = container.mapFromGlobal(self._icon_rect.topLeft())
         self._icon_rect.moveTo(tl)
+        if self._target_rect.topLeft() != QPoint(0, 0):
+            t_tl = container.mapFromGlobal(self._target_rect.topLeft())
+            self._target_rect.moveTo(t_tl)
+        else:
+            self._target_rect = QRect(container.rect())
         self._pixmap = pixmap
         self._corner_start = corner_start
         self._corner_end = corner_end
@@ -222,6 +230,16 @@ class MorphOverlay(QWidget):
         self._on_done = on_finished
         self._driver = _FrameDriver(duration, curve or Easing.MORPH,
                                     lambda p: self.set_progress(1.0 - p),
+                                    self._finish, self)
+        self.show()
+        self._driver.start()
+
+    def run_reverse_from_current(self, duration: int = Duration.TRANSITION, curve=None, on_finished=None):
+        """Прерванный морф: разворачиваем анимацию из текущего прогресса обратно к иконке."""
+        self._on_done = on_finished
+        start_p = self._progress
+        self._driver = _FrameDriver(duration, curve or Easing.MORPH,
+                                    lambda p: self.set_progress(start_p * (1.0 - p)),
                                     self._finish, self)
         self.show()
         self._driver.start()
@@ -400,3 +418,124 @@ class PageTransition(QObject):
         self._running = [fade, move]
         fade.start(QPropertyAnimation.DeleteWhenStopped)
         move.start(QPropertyAnimation.DeleteWhenStopped)
+
+
+class PageSwipe(QObject):
+    """Горизонтальный swipe-переход между страницами QStackedWidget
+    в стиле OxygenOS (shifting pages): уходящая страница съезжает и затемняется,
+    входящая выезжает с масштабированием 0.94 -> 1.0 и fade.
+
+    usage:
+        swipe = PageSwipe(stacked_widget)
+        swipe.transition_to(target_page, direction="forward")
+    """
+
+    def __init__(self, stack):
+        super().__init__(stack)
+        self._stack = stack
+        self._drivers = []
+
+    def transition_to(self, target_widget, direction: str = "forward",
+                      duration: int = Duration.TRANSITION, on_finished=None):
+        from PyQt5.QtWidgets import QGraphicsOpacityEffect
+        current = self._stack.currentWidget()
+        if current is target_widget:
+            self._stack.setCurrentWidget(target_widget)
+            if on_finished:
+                on_finished()
+            return
+
+        w = self._stack.width() or 519
+        h = self._stack.height() or 950
+        sign = 1 if direction == "forward" else -1
+
+        # Подготовим обе страницы поверх стека (steal geometry)
+        self._stack.setCurrentWidget(target_widget)
+        target_widget.raise_()
+
+        geo = self._stack.rect()
+        start_tx = geo.x() + sign * w
+        end_tx = geo.x()
+        start_cx = geo.x() - sign * int(w * 0.28)   # уходит с parallax
+        end_cx = geo.x()
+
+        target_widget.setGeometry(start_tx, geo.y(), geo.width(), geo.height())
+        if current.isVisible():
+            current.setGeometry(end_cx, geo.y(), geo.width(), geo.height())
+            eff_out = QGraphicsOpacityEffect(current)
+            current.setGraphicsEffect(eff_out)
+            eff_out.opacity = 1.0
+        else:
+            eff_out = None
+
+        eff_in = QGraphicsOpacityEffect(target_widget)
+        target_widget.setGraphicsEffect(eff_in)
+        eff_in.opacity = 0.0
+
+        def on_frame(p):
+            # Входящая: выезд + scale 0.94->1 + fade
+            s = 0.94 + 0.06 * p
+            tw = int(geo.width() * s)
+            th = int(geo.height() * s)
+            tx = start_tx + (end_tx - start_tx) * p + (geo.width() - tw) // 2
+            ty = geo.y() + (geo.height() - th) // 2
+            target_widget.setGeometry(tx, ty, tw, th)
+            eff_in.opacity = min(1.0, p * 1.6)
+            if current.isVisible():
+                cx = start_cx + (end_cx - start_cx) * p
+                current.setGeometry(cx, geo.y(), geo.width(), geo.height())
+                eff_out.opacity = 1.0 - 0.55 * p
+
+        def finish():
+            target_widget.setGeometry(geo)
+            target_widget.setGraphicsEffect(None)
+            if current.isVisible():
+                current.setGeometry(geo)
+                current.setGraphicsEffect(None)
+            eff_in.deleteLater()
+            if eff_out:
+                eff_out.deleteLater()
+            if on_finished:
+                on_finished()
+
+        driver = _FrameDriver(duration, Easing.STANDARD, on_frame, finish, self)
+        self._drivers.append(driver)
+        driver.start()
+
+
+class StaggerReveal(QObject):
+    """Волновое (staggered) появление виджетов — как сетка иконок в OxygenOS/iOS.
+
+    usage:
+        sr = StaggerReveal(parent)
+        sr.run(list_of_widgets, apply_fn=lambda w, p: ...)
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._drivers = []
+
+    def run(self, widgets, apply_fn, step_ms: int = Duration.STAGGER_STEP,
+            duration: int = Duration.STANDARD, curve=Easing.STANDARD, delay_ms: int = 0):
+        self.cancel()
+        for i, wdg in enumerate(widgets):
+            d = _FrameDriver(duration, curve,
+                             lambda p, w=wdg: apply_fn(w, p),
+                             parent=self)
+            QTimer.singleShot(delay_ms + i * step_ms, d.start)
+            self._drivers.append(d)
+
+    def cancel(self):
+        for d in self._drivers:
+            d.stop()
+        self._drivers = []
+
+    @staticmethod
+    def wave_transform(index: int, columns: int, progress: float):
+        """Диагональная волна: прогресс для элемента с учётом row+col задержки.
+        Возвращает локальный прогресс 0..1 для конкретного элемента."""
+        row = index // columns
+        col = index % columns
+        offset = (row + col) * 0.12
+        p = (progress - offset) / max(1e-6, 1.0 - offset)
+        return max(0.0, min(1.0, p))

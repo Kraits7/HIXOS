@@ -1,0 +1,6 @@
+opencv-python
+pillow
+PyQt5
+requests
+firebase-admin
+PyQtWebEngine

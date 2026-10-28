@@ -6,7 +6,10 @@ from PyQt5.QtWidgets import (
     QFrame, QSizePolicy, QApplication, QMainWindow, QSpacerItem,
     QGraphicsOpacityEffect
 )
-from PyQt5.QtGui import QPixmap, QFont, QColor, QBrush, QPainter, QLinearGradient
+from PyQt5.QtGui import (
+    QPixmap, QFont, QColor, QBrush, QPainter, QLinearGradient, QPainterPath,
+    QRadialGradient, QFontMetrics
+)
 from PyQt5.QtCore import Qt, pyqtSignal, QObject, QSize, QPoint, QPropertyAnimation, QEasingCurve, QRect, pyqtProperty, QParallelAnimationGroup, QSequentialAnimationGroup, QTimer, QPauseAnimation
 
 # --- Системный движок анимаций (OxygenOS / iOS style) ---
@@ -107,13 +110,25 @@ class AppIcon(QWidget):
         if not self.is_dock_icon:
             self.name_label = QLabel(app_name, self)
             self.name_label.setAlignment(Qt.AlignCenter)
-            self.name_label.setStyleSheet("color: white; font-size: 11px;")
-            self.name_label.setWordWrap(True) # Включаем перенос слов
-            self.name_label.setFixedSize(self.width(), 20) # Ширина виджета, высота 20px
+            # iOS 16 home screen: плотный средний шрифт, лёгкая тень под текстом
+            self.name_label.setStyleSheet(
+                "color: rgba(255,255,255,0.95); font-size: 12px; font-weight: 500;"
+                "font-family: 'SF Pro Text', 'Segoe UI', 'Roboto', sans-serif;")
+            self.name_label.setWordWrap(False) # iOS обрезает имя многоточием
+            self.name_label.setTextFormat(Qt.PlainText)
+            self.name_label.setFixedSize(self.width(), 18) # Ширина виджета, высота 18px
+            self._elide_name(app_name)
             self.layout.addWidget(self.name_label)
             self.name_label.setVisible(self._show_name) # Изначальная видимость текста
         else:
             self.name_label = None # Иконки дока не имеют текстовых меток
+
+    def _elide_name(self, name: str):
+        """Обрезка длинных имён многоточием — как в iOS."""
+        fm = QFontMetrics(self.name_label.font())
+        elided = fm.elidedText(name, Qt.ElideRight, max(10, self.width() - 2))
+        self.name_label.setText(elided)
+        self.name_label.setToolTip(name)
 
     # Определение пользовательского свойства 'scale' для анимации
     @pyqtProperty(float)
@@ -194,6 +209,13 @@ class AppIcon(QWidget):
         x_pos = (self.width() - scaled_pixmap.width()) // 2
         y_pos = (self._icon_draw_size + (5 if not self.is_dock_icon else 0) - scaled_pixmap.height()) // 2
 
+        # iOS 16-style: иконки с фирменным squircle-скруглением (~22.5% стороны)
+        side = scaled_pixmap.width()
+        if side >= 24:
+            path = QPainterPath()
+            path.addRoundedRect(x_pos, y_pos, side, side,
+                                side * 0.225, side * 0.225)
+            painter.setClipPath(path)
         painter.drawPixmap(x_pos, y_pos, scaled_pixmap)
         
         super().paintEvent(event) # Важно вызвать базовый метод для отрисовки дочерних виджетов (name_label)
@@ -241,7 +263,7 @@ class LauncherContent(QFrame):
         # Локализация имен приложений
         self.localized_app_names = {
             "Русский": {
-                "Greeting": "Привет, Пользователь!",
+                "Greeting": "Добро пожаловать",
                 "Phone": "Телефон", "Messages": "Сообщения", "Camera": "Камера",
                 "Photos": "Фото", "Store": "Магазин", "Browser": "Браузер", 
                 "Music": "Музыка", "Maps": "Карты", "Settings": "Настройки",
@@ -252,7 +274,7 @@ class LauncherContent(QFrame):
                 "Podcasts": "Подкасты",
             },
             "English": {
-                "Greeting": "Hello, User!",
+                "Greeting": "Welcome",
                 "Phone": "Phone", "Messages": "Messages", "Camera": "Camera",
                 "Photos": "Photos", "Store": "Store", "Browser": "Browser", 
                 "Music": "Music", "Maps": "Maps", "Settings": "Settings",
@@ -308,21 +330,26 @@ class LauncherContent(QFrame):
 
     def init_ui(self):
         main_vlayout = QVBoxLayout(self)
-        main_vlayout.setContentsMargins(15, 15, 15, 15) # Уменьшены отступы
-        main_vlayout.setSpacing(15) 
+        # iOS 16 home screen: симметричные боковые поля, воздух сверху
+        main_vlayout.setContentsMargins(24, 30, 24, 12)
+        main_vlayout.setSpacing(0)
 
-        # --- Верхняя часть с приветствием ---
+        # --- Верхняя часть с приветствием (iOS-заголовок крупным шрифтом) ---
         self.greeting_label = QLabel("") 
-        self.greeting_label.setAlignment(Qt.AlignTop | Qt.AlignCenter)
-        self.greeting_label.setStyleSheet("color: white; font-size: 20px; margin-bottom: 25px;") 
+        self.greeting_label.setAlignment(Qt.AlignTop | Qt.AlignHCenter)
+        self.greeting_label.setStyleSheet(
+            "color: white; font-size: 26px; font-weight: 700;"
+            "font-family: 'SF Pro Display', 'Segoe UI', 'Roboto', sans-serif;")
         main_vlayout.addWidget(self.greeting_label)
         
+        main_vlayout.addSpacing(34)
         main_vlayout.addStretch(1) 
 
         # --- Сетка иконок приложений ---
         self.app_grid_layout = QGridLayout()
-        self.app_grid_layout.setSpacing(15) # Уменьшен отступ между иконками
-        self.app_grid_layout.setAlignment(Qt.AlignTop | Qt.AlignCenter) 
+        self.app_grid_layout.setHorizontalSpacing(20) # iOS-подобные равномерные зазоры
+        self.app_grid_layout.setVerticalSpacing(26)
+        self.app_grid_layout.setAlignment(Qt.AlignTop | Qt.AlignHCenter) 
 
         self._populate_grid_apps() # Вызываем метод для заполнения сетки
 
@@ -333,28 +360,28 @@ class LauncherContent(QFrame):
         
         main_vlayout.addStretch(2) 
 
-        # --- Док-панель ---
+        # --- Док-панель: стеклянная капсула в стиле iOS 16 ---
         self.dock_frame = QFrame(self)
         self.dock_frame.setStyleSheet("""
             QFrame {
-                background-color: rgba(0, 0, 0, 0.4); 
-                border-radius: 35px; 
-                border: 1px solid rgba(255, 255, 255, 0.15); 
+                background-color: rgba(255, 255, 255, 0.10);
+                border-radius: 34px;
+                border: 1px solid rgba(255, 255, 255, 0.14);
             }
         """)
-        self.dock_frame.setFixedHeight(90) 
+        self.dock_frame.setFixedHeight(92) 
         self.dock_frame.setMaximumWidth(480) 
 
         self.dock_layout = QHBoxLayout(self.dock_frame) 
-        self.dock_layout.setContentsMargins(20, 10, 20, 10) 
-        self.dock_layout.setSpacing(25) 
+        self.dock_layout.setContentsMargins(22, 10, 22, 10) 
+        self.dock_layout.setSpacing(22) 
         self.dock_layout.setAlignment(Qt.AlignCenter)
 
         self._populate_dock_apps() # Вызываем метод для заполнения дока
 
 
         main_vlayout.addWidget(self.dock_frame, alignment=Qt.AlignCenter)
-        main_vlayout.addSpacing(25) 
+        main_vlayout.addSpacing(14) 
         
         self._update_localization() 
 
@@ -414,14 +441,19 @@ class LauncherContent(QFrame):
     def _update_localization(self):
         """Обновляет все локализуемые тексты в лаунчере."""
         current_locale = self.localized_app_names.get(self._language, self.localized_app_names["Русский"])
-        
-        self.greeting_label.setText(current_locale.get("Greeting", "Привет, Пользователь!"))
+
+        # iOS 16: на рабочем столе крупное «Добро пожаловать, {имя}»
+        username = getattr(self.main_window, "current_username", None) or "Пользователь"
+        if username in ("None", ""):
+            username = "Пользователь"
+        base_greeting = current_locale.get("Greeting", "Добро пожаловать")
+        self.greeting_label.setText(f"{base_greeting}, {username}")
 
         # Обновляем тексты для иконок в сетке
         for app_icon in self.grid_app_icons:
             new_name = current_locale.get(app_icon.app_id, app_icon.app_name)
             if app_icon.name_label:
-                app_icon.name_label.setText(new_name)
+                app_icon._elide_name(new_name)
         
         # Обновляем тексты для иконок в доке (используем сохраненные ссылки)
         for app_icon in self.dock_app_icons:
@@ -673,15 +705,30 @@ class LauncherContent(QFrame):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
 
-        # Рисуем градиентный фон
-        gradient = QLinearGradient(0, 0, 0, self.height())
-        gradient.setColorAt(0, QColor("#1f2430")) # Темно-синий/почти черный
-        gradient.setColorAt(0.5, QColor("#303a4c")) # Средний синий
-        gradient.setColorAt(1, QColor("#1f2430")) # Снова темно-синий
-        
-        painter.setBrush(QBrush(gradient))
-        painter.setPen(Qt.NoPen)
-        painter.drawRect(self.rect())
+        w, h = self.width(), self.height()
+
+        # iOS 16 wallpaper: глубокий тёмный «graphite» с мягкими цветными
+        # радиальными пятнами (как обои Default / Carbon Star).
+        base = QLinearGradient(0, 0, 0, h)
+        base.setColorAt(0.0, QColor("#0b0d14"))
+        base.setColorAt(0.5, QColor("#131722"))
+        base.setColorAt(1.0, QColor("#0a0c12"))
+        painter.fillRect(self.rect(), QBrush(base))
+
+        glows = [
+            (0.22 * w, 0.16 * h, 0.95 * w, QColor(58, 78, 140, 90)),   # синий сверху слева
+            (0.85 * w, 0.42 * h, 0.85 * w, QColor(120, 60, 150, 60)),  # фиолетовый справа
+            (0.45 * w, 1.02 * h, 0.9 * w, QColor(30, 90, 130, 70)),    # teal снизу
+        ]
+        for gx, gy, gr, gc in glows:
+            rg = QRadialGradient(gx, gy, gr)
+            rg.setColorAt(0.0, gc)
+            outer = QColor(gc)
+            outer.setAlpha(0)
+            rg.setColorAt(1.0, outer)
+            painter.setBrush(QBrush(rg))
+            painter.setPen(Qt.NoPen)
+            painter.drawRect(self.rect())
 
         super().paintEvent(event) # Важно вызвать базовый метод, чтобы отрисовались дочерние виджеты
 

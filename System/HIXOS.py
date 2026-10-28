@@ -506,8 +506,17 @@ class MainWindow(QMainWindow):
         # This simulates a first-time setup for a new (dummy) user.
         if self.user_data_manager.user_id == "dummy_user_id" and loaded_username == "Пользователь":
             print("User data not found or incomplete (dummy). Launching Out-of-Box Experience (OOBE).")
-            self.setup_page.current_language = self.current_language
-            self.setup_page.initial_navigation_mode = self.current_navigation_mode
+            # Совместимость со старым кодом HIXOS.py: подхватываем язык/навигацию,
+            # если они были присвоены как атрибуты до показа страницы.
+            self.setup_page.welcome_page.group.select_by_index(
+                ["Русский", "English", "Deutsch", "Français"].index(
+                    getattr(self.setup_page, "current_language", "Русский"))) \
+                if getattr(self.setup_page, "current_language", None) else None
+            nm = getattr(self.setup_page, "initial_navigation_mode", None)
+            if nm:
+                modes = [NAVIGATION_MODE_THREE_BUTTON, NAVIGATION_MODE_GESTURES]
+                if nm in modes:
+                    self.setup_page.navigation_choice_page.group.select_by_index(modes.index(nm))
             self.show_setup_page()
         else:
             print(f"Dummy data loaded. Transitioning to lock screen for user: {self.current_username}.")

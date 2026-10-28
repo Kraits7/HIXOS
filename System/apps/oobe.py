@@ -1,568 +1,669 @@
-# apps/oobe.py
+# apps/oobe.py — v2. Новый OOBE в стиле iOS 17 / OxygenOS setup:
+#  • крупная «proximity»-типографика, много воздуха, тонкие разделители;
+#  • выбор — не радиокнопки и комбобоксы, а карточки-плитки с press-feedback;
+#  • push/pop переходы страниц через движок анимаций системы (PageSwipe);
+#  • прогресс-бар из точек, активная точка плавно расширяется (spring);
+#  • финальная страница — большой чекмар с spring-pop + мягкий fade текста.
 import sys
 import os
+
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QComboBox,
-    QStackedWidget, QLineEdit, QScrollArea, QApplication, QMessageBox,
-    QTextBrowser, QRadioButton, QButtonGroup, QSpacerItem, QSizePolicy, QFrame
+    QStackedWidget, QLineEdit, QApplication, QMessageBox, QTextBrowser,
+    QFrame, QSizePolicy, QGraphicsOpacityEffect, QScrollArea
 )
-from PyQt5.QtCore import Qt, pyqtSignal, QSize
-from PyQt5.QtGui import QFont, QColor, QBrush, QPainter, QLinearGradient
+from PyQt5.QtCore import (
+    Qt, pyqtSignal, pyqtProperty, QObject, QTimer, QRect, QPoint, QSize,
+    QPropertyAnimation, QEasingCurve
+)
+from PyQt5.QtGui import QFont, QColor, QPainter, QPen, QBrush, QPixmap
 
-# Импортируем константы навигации из navigation_bar
 from ui.navigation_bar import NAVIGATION_MODE_THREE_BUTTON, NAVIGATION_MODE_GESTURES
 
+try:
+    from ui.animation_engine import (
+        Easing, Duration, PageSwipe, _FrameDriver, animate,
+        spring_progress, fly_in_transform,
+    )
+except ImportError:
+    from animation_engine import (
+        Easing, Duration, PageSwipe, _FrameDriver, animate,
+        spring_progress, fly_in_transform,
+    )
 
-# Базовый класс для страниц OOBE, содержит общие стили и навигационные кнопки
+
+ACCENT = "#0A84FF"          # iOS dark-mode blue
+BG = "#0b0d12"              # почти чёрный с синим подтоном (iOS setup)
+CARD = "rgba(255,255,255,0.06)"
+CARD_SELECTED = "rgba(10,132,255,0.18)"
+TEXT_PRIMARY = "#FFFFFF"
+TEXT_SECONDARY = "rgba(255,255,255,0.55)"
+
+
+def global_qss():
+    return f"""
+    QWidget {{
+        background-color: {BG};
+        color: {TEXT_PRIMARY};
+        font-family: "Inter", "SF Pro Display", "Segoe UI", "Roboto", sans-serif;
+    }}
+    QLabel#pageTitle {{
+        font-size: 32px;
+        font-weight: 800;
+        letter-spacing: -0.5px;
+        color: {TEXT_PRIMARY};
+    }}
+    QLabel#pageSubtitle {{
+        font-size: 16px;
+        color: {TEXT_SECONDARY};
+    }}
+    QLineEdit {{
+        border: none;
+        border-radius: 14px;
+        padding: 16px 18px;
+        background-color: {CARD};
+        color: white;
+        font-size: 17px;
+        selection-background-color: {ACCENT};
+    }}
+    QLineEdit:focus {{
+        background-color: rgba(255,255,255,0.09);
+    }}
+    QTextBrowser {{
+        background-color: rgba(255,255,255,0.04);
+        border: none;
+        border-radius: 16px;
+        padding: 14px;
+        color: rgba(255,255,255,0.75);
+        font-size: 13px;
+    }}
+    QPushButton#primaryButton {{
+        background-color: {ACCENT};
+        color: white;
+        border: none;
+        border-radius: 16px;
+        padding: 16px 20px;
+        font-size: 17px;
+        font-weight: 700;
+    }}
+    QPushButton#primaryButton:hover {{
+        background-color: #0a74e0;
+    }}
+    QPushButton#primaryButton:pressed {{
+        background-color: #0860bb;
+    }}
+    QPushButton#primaryButton:disabled {{
+        background-color: rgba(255,255,255,0.08);
+        color: rgba(255,255,255,0.3);
+    }}
+    QPushButton#textLink {{
+        background: transparent;
+        border: none;
+        color: {ACCENT};
+        font-size: 16px;
+        font-weight: 600;
+        padding: 12px;
+    }}
+    QPushButton#textLink:hover {{
+        color: #4da3ff;
+    }}
+    """
+
+
+class TileCard(QFrame):
+    """Карточка-плитка выбора (как «Wi-Fi / Язык» в iOS setup):
+    заголовок, подпись, справа — индикатор selected (галочка в круге),
+    плавный press-scale и анимированная подсветка при выборе."""
+
+    clicked_tile = pyqtSignal()
+
+    def __init__(self, title: str, subtitle: str = "", parent=None):
+        super().__init__(parent)
+        self._selected = False
+        self._hl = 0.0            # 0..1 highlight progress (анимируемое свойство)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.setMinimumHeight(66 if subtitle else 56)
+
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(18, 12, 16, 12)
+        lay.setSpacing(12)
+
+        txt = QVBoxLayout()
+        txt.setSpacing(2)
+        t = QLabel(title)
+        t.setStyleSheet(f"font-size: 17px; font-weight: 600; color: {TEXT_PRIMARY}; background: transparent;")
+        txt.addWidget(t)
+        if subtitle:
+            s = QLabel(subtitle)
+            s.setStyleSheet(f"font-size: 13px; color: {TEXT_SECONDARY}; background: transparent;")
+            txt.addWidget(s)
+        lay.addLayout(txt)
+        lay.addStretch(1)
+
+        self.check = QLabel("✓", self)
+        self.check.setFixedSize(24, 24)
+        self.check.setAlignment(Qt.AlignCenter)
+        self._update_check_style()
+        lay.addWidget(self.check)
+
+    def _update_check_style(self):
+        if self._selected:
+            self.check.setStyleSheet(
+                f"background-color: {ACCENT}; color: white; border-radius: 12px;"
+                "font-size: 14px; font-weight: bold;")
+        else:
+            self.check.setStyleSheet(
+                "background-color: transparent; color: transparent;"
+                "border: 2px solid rgba(255,255,255,0.18); border-radius: 12px;")
+
+    @pyqtProperty(float)
+    def hl(self):
+        return self._hl
+
+    @hl.setter
+    def hl(self, v):
+        self._hl = v
+        self.update()
+
+    def set_selected(self, sel: bool):
+        if self._selected == sel:
+            return
+        self._selected = sel
+        self._update_check_style()
+        anim = animate(self, b"hl", self._hl, 1.0 if sel else 0.0,
+                       Duration.SHORT, Easing.STANDARD, self)
+        anim.start()
+
+    def is_selected(self):
+        return self._selected
+
+    def mousePressEvent(self, event):
+        a = animate(self, b"hl", self._hl, max(0.0, self._hl * 0.55) + 0.12,
+                    Duration.MICRO, Easing.STANDARD, self)
+        a.start()
+        self.clicked_tile.emit()
+        super().mousePressEvent(event)
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        r = self.rect().adjusted(1, 1, -1, -1)
+        base = QColor(CARD_SELECTED) if self._selected else QColor(CARD)
+        # press/hover добавляет яркости
+        glow = int(self._hl * 26)
+        col = QColor(base)
+        col.setRed(min(255, col.red() + glow))
+        col.setGreen(min(255, col.green() + glow))
+        col.setBlue(min(255, col.blue() + glow))
+        p.setPen(QPen(QColor(ACCENT) if self._selected else QColor("rgba(255,255,255,0.08)"),
+                      1.6 if self._selected else 1.0))
+        p.setBrush(QBrush(col))
+        p.drawRoundedRect(r, 16, 16)
+        p.end()
+        super().paintEvent(event)
+
+
+class TileGroup(QObject):
+    """Эксклюзивная группа TileCard (как QButtonGroup для плиток)."""
+
+    selection_changed = pyqtSignal(object)  # выбранная карточка
+
+    def __init__(self, cards, parent=None):
+        super().__init__(parent)
+        self.cards = list(cards)
+        self._current = None
+        for c in self.cards:
+            c.clicked_tile.connect(lambda card=c: self._select(card))
+
+    def _select(self, card):
+        if self._current is card:
+            return
+        self._current = card
+        for c in self.cards:
+            c.set_selected(c is card)
+        self.selection_changed.emit(card)
+
+    def select_by_index(self, i):
+        if 0 <= i < len(self.cards):
+            self._select(self.cards[i])
+
+    def current_index(self):
+        if self._current in self.cards:
+            return self.cards.index(self._current)
+        return -1
+
+
 class BaseOOBEPage(QWidget):
-    # Сигналы для навигации между страницами OOBE
+    """Общий каркас страницы: отступы, заголовок/подзаголовок, место под контент
+    и нижняя кнопка действия. Появление контента — spring-прилёт (iOS style)."""
+
     next_page_requested = pyqtSignal()
     prev_page_requested = pyqtSignal()
-    # Сигнал для завершения OOBE, передает выбранный язык, режим навигации и имя пользователя
-    finish_oobe_requested = pyqtSignal(str, str, str) 
+    finish_oobe_requested = pyqtSignal(str, str, str)
 
-    def __init__(self, parent=None, oobe_content_instance=None): # Добавлен oobe_content_instance
+    def __init__(self, parent=None, oobe=None):
         super().__init__(parent)
-        self.oobe_content_instance = oobe_content_instance # Сохраняем ссылку на OOBEContent
+        self.oobe = oobe
+        self.root = QVBoxLayout(self)
+        self.root.setContentsMargins(28, 10, 28, 24)
+        self.root.setSpacing(0)
 
-        self.main_layout = QVBoxLayout(self)
-        self.main_layout.setContentsMargins(30, 30, 30, 30)
-        self.main_layout.setSpacing(15) # Увеличен отступ между элементами
-        self.main_layout.setAlignment(Qt.AlignTop | Qt.AlignHCenter)
-        
-        # Общие стили для всех страниц OOBE в стиле OxygenOS
-        self.setStyleSheet("""
-            QWidget {
-                background-color: #1a1a1a; /* Очень темный фон */
-                color: white;
-                font-family: "Inter", "Segoe UI", "SF Pro Display", "Roboto", sans-serif;
-            }
-            QLabel {
-                font-size: 16px;
-                margin-bottom: 5px; /* Уменьшен отступ */
-            }
-            QLabel#pageTitle { /* Стиль для заголовков страниц */
-                font-size: 28px;
-                font-weight: bold;
-                color: #007AFF; /* Основной акцентный цвет */
-                margin-bottom: 25px;
-            }
-            QLabel#instructionText { /* Стиль для инструкций */
-                font-size: 15px;
-                color: #BBBBBB;
-                margin-bottom: 20px;
-            }
-            QPushButton {
-                background-color: #007AFF; /* Синий цвет кнопки */
-                color: white;
-                border-radius: 12px; /* Более скругленные углы */
-                padding: 15px 30px; /* Увеличенный паддинг */
-                font-size: 18px; /* Увеличенный шрифт */
-                font-weight: bold;
-                min-height: 45px; /* Минимальная высота кнопки */
-            }
-            QPushButton:hover {
-                background-color: #0056b3; /* Цвет при наведении */
-            }
-            QPushButton:pressed {
-                background-color: #004d9c; /* Цвет при нажатии */
-            }
-            QPushButton:disabled {
-                background-color: #333333; /* Неактивная кнопка */
-                color: #888888;
-            }
-            QLineEdit {
-                border: 1px solid #444; /* Более темная рамка */
-                border-radius: 10px; /* Скругленные углы */
-                padding: 12px; /* Увеличенный паддинг */
-                background-color: #2c2c2c; /* Темный фон поля ввода */
-                color: white;
-                font-size: 16px;
-            }
-            QComboBox {
-                border: 1px solid #444;
-                border-radius: 10px;
-                padding: 12px;
-                background-color: #2c2c2c;
-                color: white;
-                font-size: 16px;
-            }
-            QComboBox::drop-down {
-                border: 0px;
-            }
-            QComboBox QAbstractItemView {
-                border: 1px solid #444;
-                background-color: #2c2c2c;
-                selection-background-color: #007AFF;
-                color: white;
-            }
-            QTextBrowser {
-                background-color: #2c2c2c;
-                border: 1px solid #444;
-                border-radius: 10px;
-                padding: 15px;
-                color: #DDDDDD; /* Более светлый текст */
-                font-size: 14px;
-            }
-            QRadioButton {
-                color: white;
-                font-size: 16px; /* Увеличенный шрифт */
-                margin-bottom: 10px; /* Увеличенный отступ */
-            }
-            QRadioButton::indicator {
-                width: 18px; /* Увеличенный индикатор */
-                height: 18px;
-                border-radius: 9px; /* Круглый индикатор */
-                border: 2px solid #555; /* Более толстая рамка */
-                background-color: #333;
-            }
-            QRadioButton::indicator:hover {
-                border: 2px solid #007AFF;
-            }
-            QRadioButton::indicator:checked {
-                background-color: #007AFF;
-                border: 2px solid #007AFF;
-            }
-            /* Стиль для кнопки "Назад" */
-            QPushButton#backButton {
-                background-color: transparent;
-                border: 1px solid #444; /* Тонкая рамка */
-                color: #007AFF;
-                border-radius: 12px;
-                padding: 10px 20px;
-                font-size: 16px;
-                font-weight: bold;
-            }
-            QPushButton#backButton:hover {
-                background-color: rgba(0, 122, 255, 0.1); /* Легкий синий фон при наведении */
-            }
-        """)
+        self.header_box = QVBoxLayout()
+        self.header_box.setSpacing(6)
+        self.title_label = QLabel("")
+        self.title_label.setObjectName("pageTitle")
+        self.subtitle_label = QLabel("")
+        self.subtitle_label.setObjectName("pageSubtitle")
+        self.subtitle_label.setWordWrap(True)
+        self.header_box.addWidget(self.title_label)
+        self.header_box.addWidget(self.subtitle_label)
+        self.root.addLayout(self.header_box)
+        self.root.addSpacing(26)
 
-    def add_navigation_buttons(self, show_back=True, show_next=True, next_text="Далее", finish_text="Завершить"):
-        nav_layout = QHBoxLayout()
-        nav_layout.addStretch(1) # Растяжка для выравнивания кнопок справа
+        self.content_box = QVBoxLayout()
+        self.content_box.setSpacing(10)
+        self.root.addLayout(self.content_box)
+        self.root.addStretch(1)
 
-        if show_back:
-            back_button = QPushButton("Назад")
-            back_button.setObjectName("backButton") # Устанавливаем objectName для специфичного QSS
-            back_button.clicked.connect(self.prev_page_requested.emit)
-            nav_layout.addWidget(back_button)
-            nav_layout.addSpacing(15) # Отступ между кнопками
-        
-        if show_next:
-            if next_text == "Завершить" or next_text == "Начать работу":
-                self.next_button = QPushButton(finish_text)
-                self.next_button.clicked.connect(
-                    lambda: self.finish_oobe_requested.emit(
-                        self.oobe_content_instance._current_language, 
-                        self.oobe_content_instance._current_navigation_mode,
-                        self.oobe_content_instance._username 
-                    )
-                )
-            else:
-                self.next_button = QPushButton(next_text)
-                self.next_button.clicked.connect(self.next_page_requested.emit)
-            nav_layout.addWidget(self.next_button)
-        
-        self.main_layout.addLayout(nav_layout)
-    
-    def get_selected_language(self):
-        return "Русский" 
+        self.footer_box = QVBoxLayout()
+        self.footer_box.setSpacing(4)
+        self.root.addLayout(self.footer_box)
 
-    def get_selected_navigation_mode(self):
-        return NAVIGATION_MODE_THREE_BUTTON
+    def set_title(self, title, subtitle=""):
+        self.title_label.setText(title)
+        self.subtitle_label.setText(subtitle)
+        self.subtitle_label.setVisible(bool(subtitle))
 
-    def get_username(self):
-        return ""
+    def add_primary_button(self, text, handler, object_name="primaryButton"):
+        btn = QPushButton(text)
+        btn.setObjectName(object_name)
+        btn.setCursor(Qt.PointingHandCursor)
+        btn.setMinimumHeight(54)
+        btn.clicked.connect(handler)
+        self.footer_box.addWidget(btn)
+        return btn
+
+    def add_secondary_link(self, text, handler):
+        btn = QPushButton(text)
+        btn.setObjectName("textLink")
+        btn.setCursor(Qt.PointingHandCursor)
+        btn.clicked.connect(handler)
+        self.footer_box.addWidget(btn)
+        return btn
+
+    def reveal_widgets(self):
+        """Spring-прилёт содержимого страницы снизу (как экраны iOS setup)."""
+        targets = []
+        for i in range(self.content_box.count()):
+            item = self.content_box.itemAt(i)
+            w = item.widget()
+            if w is not None:
+                targets.append(w)
+        for lbl in (self.title_label, self.subtitle_label):
+            if lbl.isVisible():
+                targets.insert(0, lbl) if lbl is self.title_label else targets.append(lbl)
+        footer = [self.footer_box.itemAt(i).widget()
+                  for i in range(self.footer_box.count())
+                  if self.footer_box.itemAt(i) and self.footer_box.itemAt(i).widget()]
+        targets.extend(footer)
+
+        drivers = getattr(self, "_reveal_drivers", [])
+        for d in drivers:
+            d.stop()
+        self._reveal_drivers = []
+
+        for idx, w in enumerate(targets):
+            eff = QGraphicsOpacityEffect(w)
+            w.setGraphicsEffect(eff)
+            base_y = w.y()
+            off = 0.06 + idx * 0.05
+
+            def make(widget, effect, by, o):
+                def frame(p):
+                    lp = max(0.0, min(1.0, (p - o) / max(1e-6, 1.0 - o)))
+                    dy, scale, opacity = fly_in_transform(lp)
+                    effect.setOpacity(opacity)
+                    widget.move(widget.x(), int(by + dy))
+                def done(widget=widget, by=by):
+                    widget.setGraphicsEffect(None)
+                    widget.move(widget.x(), by)
+                return frame, done
+
+            frame_fn, done_fn = make(w, eff, base_y, off)
+            drv = _FrameDriver(420, QEasingCurve.Linear, frame_fn, done_fn, self)
+            drv.start()
+            self._reveal_drivers.append(drv)
 
 
-# OOBE Страница 1: Приветствие и Выбор языка
 class WelcomeLanguagePage(BaseOOBEPage):
-    def __init__(self, parent=None, oobe_content_instance=None, current_language="Русский"): 
-        super().__init__(parent, oobe_content_instance) 
-        
-        self._selected_language = current_language 
+    def __init__(self, parent=None, oobe=None, current_language="Русский"):
+        super().__init__(parent, oobe)
+        self.set_title("Добро пожаловать",
+                       "Это HIX OS. Выберите язык — его можно будет сменить\nв Настройках в любой момент.")
 
-        title_label = QLabel("Добро пожаловать в HIXOS!")
-        title_label.setObjectName("pageTitle")
-        title_label.setAlignment(Qt.AlignCenter)
-        self.main_layout.addWidget(title_label)
+        langs = ["Русский", "English", "Deutsch", "Français"]
+        subs = ["Russian", "Английский", "Немецкий", "Французский"]
+        cards = []
+        for name, sub in zip(langs, subs):
+            c = TileCard(name, sub, self)
+            self.content_box.addWidget(c)
+            cards.append(c)
+        self.group = TileGroup(cards, self)
+        try:
+            self.group.select_by_index(langs.index(current_language))
+        except ValueError:
+            self.group.select_by_index(0)
 
-        instruction_label = QLabel("Пожалуйста, выберите язык системы:")
-        instruction_label.setObjectName("instructionText")
-        instruction_label.setAlignment(Qt.AlignCenter)
-        self.main_layout.addWidget(instruction_label)
-
-        language_layout = QHBoxLayout()
-        language_layout.addStretch(1)
-        language_label = QLabel("Язык:")
-        language_label.setStyleSheet("font-size: 16px;") # Увеличиваем шрифт для метки
-        language_layout.addWidget(language_label)
-        
-        self.language_combo = QComboBox()
-        self.language_combo.addItems(["Русский", "English", "Deutsch", "Français"])
-        self.language_combo.setCurrentText(self._selected_language) 
-        self.language_combo.currentIndexChanged.connect(self._on_language_changed)
-        language_layout.addWidget(self.language_combo)
-        language_layout.addStretch(1)
-        self.main_layout.addLayout(language_layout)
-
-        self.main_layout.addStretch(1) 
-        self.add_navigation_buttons(show_back=False, next_text="Далее")
-
-    def _on_language_changed(self, index):
-        self._selected_language = self.language_combo.currentText()
+        self.add_primary_button("Продолжить", self.next_page_requested.emit)
 
     def get_selected_language(self):
-        return self._selected_language
+        idx = self.group.current_index()
+        return ["Русский", "English", "Deutsch", "Français"][max(0, idx)]
 
 
-# OOBE Страница 2: Лицензионное Соглашение с Конечным Пользователем (EULA)
 class EULAPage(BaseOOBEPage):
-    def __init__(self, parent=None, oobe_content_instance=None): 
-        super().__init__(parent, oobe_content_instance) 
+    def __init__(self, parent=None, oobe=None):
+        super().__init__(parent, oobe)
+        self.set_title("Лицензионное соглашение",
+                       "Коротко: система бесплатна, предоставляется «как есть»,\n"
+                       "вы можете использовать её для любых личных целей.")
 
-        title_label = QLabel("Лицензионное Соглашение")
-        title_label.setObjectName("pageTitle")
-        title_label.setAlignment(Qt.AlignCenter)
-        self.main_layout.addWidget(title_label)
-
-        instruction_label = QLabel("Пожалуйста, ознакомьтесь с условиями использования HIXOS.")
-        instruction_label.setObjectName("instructionText")
-        instruction_label.setAlignment(Qt.AlignCenter)
-        self.main_layout.addWidget(instruction_label)
-
-        eula_text = """
-        ДОБРО ПОЖАЛОВАТЬ В HIXOS!
-
-        ВНИМАТЕЛЬНО ПРОЧТИТЕ ДАННОЕ ЛИЦЕНЗИОННОЕ СОГЛАШЕНИЕ ПОЛЬЗОВАТЕЛЯ (далее – «Соглашение»).
-        ИСПОЛЬЗУЯ СИСТЕМУ HIXOS, ВЫ ПОДТВЕРЖДАЕТЕ СВОЕ СОГЛАСИЕ СО ВСЕМИ УСЛОВИЯМИ ДАННОГО СОГЛАШЕНИЯ.
-
-        1. Лицензия. Вам предоставляется неисключительная, непередаваемая лицензия на использование HIXOS.
-        2. Ограничения. Вы не можете декомпилировать, изменять, распространять или продавать HIXOS.
-        3. Отказ от гарантий. HIXOS предоставляется «как есть», без каких-либо гарантий.
-        4. Ограничение ответственности. Мы не несем ответственности за любые убытки, возникшие в результате использования HIXOS.
-        5. Изменения. Мы оставляем за собой право изменять это Соглашение в любое время.
-
-        Нажимая "Принять и Продолжить", вы соглашаетесь с этими условиями.
-        """
-        
-        self.eula_viewer = QTextBrowser()
+        eula_text = (
+            "HIX OS License Agreement\n\n"
+            "1. Лицензия. Вам предоставляется неисключительная лицензия на использование HIX OS.\n"
+            "2. Ограничения. Запрещено продавать систему под видом собственной.\n"
+            "3. Гарантии. Система предоставляется «как есть», без гарантий.\n"
+            "4. Ответственность. Авторы не несут ответственности за убытки от использования.\n"
+            "5. Изменения. Условия могут обновляться вместе с новыми версиями.\n\n"
+            "Нажимая «Принять», вы соглашаетесь с этими условиями."
+        )
+        self.eula_viewer = QTextBrowser(self)
         self.eula_viewer.setPlainText(eula_text)
-        self.eula_viewer.setReadOnly(True) 
-        self.main_layout.addWidget(self.eula_viewer)
+        self.eula_viewer.setFixedHeight(220)
+        self.content_box.addWidget(self.eula_viewer)
 
-        self.accept_checkbox = QPushButton("Я принимаю условия соглашения")
-        self.accept_checkbox.setCheckable(True) 
-        self.accept_checkbox.setChecked(False)
-        self.accept_checkbox.setStyleSheet("""
-            QPushButton {
-                background-color: #333; /* Темнее, чем основные кнопки */
-                color: white;
-                border-radius: 12px;
-                padding: 12px 25px;
-                font-size: 16px;
-                font-weight: bold;
-                margin-top: 15px;
-            }
-            QPushButton:checked {
-                background-color: #34C759; /* Зеленый при принятии */
-            }
-            QPushButton:hover {
-                background-color: #555;
-            }
-        """)
-        self.main_layout.addWidget(self.accept_checkbox, alignment=Qt.AlignCenter)
+        accept_card_hint = QLabel("Прокрутите текст, чтобы разблокировать кнопку")
+        accept_card_hint.setObjectName("pageSubtitle")
+        accept_card_hint.setAlignment(Qt.AlignCenter)
+        self.content_box.addWidget(accept_card_hint)
+        self.hint_label = accept_card_hint
 
-        self.main_layout.addStretch(1)
-        self.add_navigation_buttons(show_back=True, next_text="Принять и Продолжить")
-        
-        self.next_button.setEnabled(False) 
-        self.accept_checkbox.toggled.connect(self.next_button.setEnabled) 
+        self.next_button = self.add_primary_button("Принять", self.next_page_requested.emit)
+        self.back_link = self.add_secondary_link("Назад", self.prev_page_requested.emit)
 
-
-# OOBE Страница 3: Настройка учетной записи пользователя
-class UserSetupPage(BaseOOBEPage):
-    def __init__(self, parent=None, oobe_content_instance=None): 
-        super().__init__(parent, oobe_content_instance) 
-        self._username = "" 
-
-        title_label = QLabel("Создайте учетную запись")
-        title_label.setObjectName("pageTitle")
-        title_label.setAlignment(Qt.AlignCenter)
-        self.main_layout.addWidget(title_label)
-
-        instruction_label = QLabel("Введите имя пользователя для вашей системы HIXOS.")
-        instruction_label.setObjectName("instructionText")
-        instruction_label.setAlignment(Qt.AlignCenter)
-        self.main_layout.addWidget(instruction_label)
-
-        username_layout = QHBoxLayout()
-        username_layout.addStretch(1)
-        username_label = QLabel("Имя пользователя:")
-        username_label.setStyleSheet("font-size: 16px;")
-        username_layout.addWidget(username_label)
-        
-        self.username_input = QLineEdit()
-        self.username_input.setPlaceholderText("Ваше имя")
-        self.username_input.textChanged.connect(self._on_username_changed) 
-        username_layout.addWidget(self.username_input)
-        username_layout.addStretch(1)
-        self.main_layout.addLayout(username_layout)
-
-        self.main_layout.addSpacing(15) 
-
-        self.main_layout.addStretch(1)
-        self.add_navigation_buttons(show_back=True, next_text="Создать учетную запись")
-        
         self.next_button.setEnabled(False)
-        self.username_input.textChanged.connect(self._check_input)
+        self.eula_viewer.verticalScrollBar().rangeChanged.connect(self._on_range)
+        self.eula_viewer.verticalScrollBar().valueChanged.connect(self._on_scroll)
 
-    def _check_input(self, text):
-        self.next_button.setEnabled(bool(text.strip())) 
+    def _on_range(self, mn, mx):
+        self._max_scroll = mx
 
-    def _on_username_changed(self, text):
-        self._username = text 
+    def _on_scroll(self, v):
+        if v >= getattr(self, "_max_scroll", 1) - 4:
+            if not self.next_button.isEnabled():
+                self.next_button.setEnabled(True)
+                self.hint_label.setText("Спасибо! Можно продолжать →")
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        # если контент короче области — сразу принимаем
+        QTimer.singleShot(60, lambda: (
+            self.next_button.setEnabled(True)
+            if self.eula_viewer.verticalScrollBar().maximum() == 0 else None))
+
+
+class UserSetupPage(BaseOOBEPage):
+    def __init__(self, parent=None, oobe=None):
+        super().__init__(parent, oobe)
+        self._username = ""
+        self.set_title("Как к вам обращаться?",
+                       "Имя появится на экране блокировки и в приветствии рабочего стола.")
+
+        self.avatar = QLabel(self)
+        self.avatar.setFixedSize(88, 88)
+        self.avatar.setAlignment(Qt.AlignCenter)
+        self.avatar.setStyleSheet(
+            f"background-color: linear-gradient(#0A84FF,#5E5CE6);"
+            "border-radius: 44px; font-size: 34px; font-weight: 800; color: white;")
+        av_wrap = QHBoxLayout()
+        av_wrap.addStretch(1)
+        av_wrap.addWidget(self.avatar)
+        av_wrap.addStretch(1)
+        self.content_box.addLayout(av_wrap)
+        self.content_box.addSpacing(8)
+
+        self.username_input = QLineEdit(self)
+        self.username_input.setPlaceholderText("Введите имя…")
+        self.username_input.setAlignment(Qt.AlignCenter)
+        self.username_input.textChanged.connect(self._on_text)
+        self.content_box.addWidget(self.username_input)
+
+        self.next_button = self.add_primary_button("Создать профиль", self.next_page_requested.emit)
+        self.next_button.setEnabled(False)
+        self.add_secondary_link("Назад", self.prev_page_requested.emit)
+
+    def _on_text(self, text):
+        self._username = text.strip()
+        self.next_button.setEnabled(bool(self._username))
+        self.avatar.setText(self._username[0].upper() if self._username else "")
 
     def get_username(self):
-        return self._username 
+        return self._username
 
 
-# OOBE Страница 4: Выбор типа навигации
 class NavigationChoicePage(BaseOOBEPage):
-    def __init__(self, parent=None, oobe_content_instance=None, initial_navigation_mode=NAVIGATION_MODE_THREE_BUTTON): 
-        super().__init__(parent, oobe_content_instance) 
-        self._selected_navigation_mode = initial_navigation_mode
+    def __init__(self, parent=None, oobe=None, initial_navigation_mode=NAVIGATION_MODE_THREE_BUTTON):
+        super().__init__(parent, oobe)
+        self.set_title("Выберите навигацию",
+                       "Три кнопки — классика Android. Жесты — больше места\nпод контент и свайпы, как в современных смартфонах.")
 
-        title_label = QLabel("Выберите тип навигации")
-        title_label.setObjectName("pageTitle")
-        title_label.setAlignment(Qt.AlignCenter)
-        self.main_layout.addWidget(title_label)
+        self.card_buttons = TileCard(
+            "Три кнопки", "Назад · Домой · Недавние", self)
+        self.card_gestures = TileCard(
+            "Жесты", "Свайпы от краёв и снизу", self)
+        self.content_box.addWidget(self.card_buttons)
+        self.content_box.addWidget(self.card_gestures)
 
-        instruction_label = QLabel("Как вы предпочитаете управлять системой?")
-        instruction_label.setObjectName("instructionText")
-        instruction_label.setAlignment(Qt.AlignCenter)
-        self.main_layout.addWidget(instruction_label)
+        self.group = TileGroup([self.card_buttons, self.card_gestures], self)
+        self._modes = [NAVIGATION_MODE_THREE_BUTTON, NAVIGATION_MODE_GESTURES]
+        self.group.select_by_index(
+            self._modes.index(initial_navigation_mode)
+            if initial_navigation_mode in self._modes else 0)
 
-        self.navigation_group = QButtonGroup(self)
-        self.navigation_group.setExclusive(True)
-
-        self.three_button_radio = QRadioButton("Три кнопки (Назад, Домой, Недавние)")
-        self.three_button_radio.setStyleSheet("QRadioButton { font-size: 16px; margin-bottom: 10px; } QRadioButton::indicator { width: 18px; height: 18px; border-radius: 9px; border: 2px solid #555; background-color: #333; } QRadioButton::indicator:checked { background-color: #007AFF; border: 2px solid #007AFF; }")
-        self.three_button_radio.setChecked(self._selected_navigation_mode == NAVIGATION_MODE_THREE_BUTTON)
-        self.three_button_radio.toggled.connect(lambda checked: self._on_mode_selected(NAVIGATION_MODE_THREE_BUTTON, checked))
-        self.navigation_group.addButton(self.three_button_radio)
-        self.main_layout.addWidget(self.three_button_radio)
-
-        self.gestures_radio = QRadioButton("Жесты (свайпы для навигации)")
-        self.gestures_radio.setStyleSheet("QRadioButton { font-size: 16px; margin-bottom: 10px; } QRadioButton::indicator { width: 18px; height: 18px; border-radius: 9px; border: 2px solid #555; background-color: #333; } QRadioButton::indicator:checked { background-color: #007AFF; border: 2px solid #007AFF; }")
-        self.gestures_radio.setChecked(self._selected_navigation_mode == NAVIGATION_MODE_GESTURES)
-        self.gestures_radio.toggled.connect(lambda checked: self._on_mode_selected(NAVIGATION_MODE_GESTURES, checked))
-        self.navigation_group.addButton(self.gestures_radio)
-        self.main_layout.addWidget(self.gestures_radio)
-        
-        self.main_layout.addStretch(1)
-        
-        self.add_navigation_buttons(show_back=True, next_text="Далее")
-        
-    def _on_mode_selected(self, mode: str, checked: bool):
-        if checked:
-            self._selected_navigation_mode = mode
-            print(f"NavigationChoicePage: Выбран режим навигации: {self._selected_navigation_mode}")
+        self.add_primary_button("Продолжить", self.next_page_requested.emit)
+        self.add_secondary_link("Назад", self.prev_page_requested.emit)
 
     def get_selected_navigation_mode(self):
-        return self._selected_navigation_mode
+        idx = self.group.current_index()
+        return self._modes[max(0, idx)]
 
 
-# OOBE Страница 5: Завершение настройки
 class FinalOOBEPage(BaseOOBEPage):
-    def __init__(self, parent=None, oobe_content_instance=None): 
-        super().__init__(parent, oobe_content_instance) 
+    def __init__(self, parent=None, oobe=None):
+        super().__init__(parent, oobe)
+        self.set_title("Всё готово!", "")
 
-        title_label = QLabel("Настройка завершена!")
-        title_label.setObjectName("pageTitle")
-        title_label.setStyleSheet("font-size: 32px; font-weight: bold; margin-bottom: 20px; color: #34C759;") # Более крупный шрифт, зеленый цвет
-        title_label.setAlignment(Qt.AlignCenter)
-        self.main_layout.addWidget(title_label)
+        # Spring-pop чекмар
+        self.check_circle = QLabel(self)
+        self.check_circle.setFixedSize(110, 110)
+        self.check_circle.setAlignment(Qt.AlignCenter)
+        self.check_circle.setStyleSheet(
+            f"background-color: {ACCENT}; color: white;"
+            "border-radius: 55px; font-size: 54px; font-weight: 800;")
+        self.check_circle.setText("✓")
+        wrap = QHBoxLayout()
+        wrap.addStretch(1)
+        wrap.addWidget(self.check_circle)
+        wrap.addStretch(1)
+        self.content_box.addLayout(wrap)
+        self.content_box.addSpacing(14)
 
-        info_label = QLabel("Поздравляем! Ваша система HIXOS готова к использованию.")
-        info_label.setObjectName("instructionText")
-        info_label.setStyleSheet("font-size: 18px;") # Увеличенный шрифт
-        info_label.setAlignment(Qt.AlignCenter)
-        self.main_layout.addWidget(info_label)
+        summary = QLabel("Профиль создан, система настроена.\nПриятного пользования HIX OS!")
+        summary.setObjectName("pageSubtitle")
+        summary.setAlignment(Qt.AlignCenter)
+        self.content_box.addWidget(summary)
 
-        enjoy_label = QLabel("Наслаждайтесь!")
-        enjoy_label.setStyleSheet("font-size: 24px; font-style: italic; margin-top: 30px; color: #BBBBBB;") # Более крупный, серый
-        enjoy_label.setAlignment(Qt.AlignCenter)
-        self.main_layout.addWidget(enjoy_label)
+        self.add_primary_button(
+            "Начать работу",
+            lambda: self.finish_oobe_requested.emit(
+                self.oobe._current_language,
+                self.oobe._current_navigation_mode,
+                self.oobe._username))
 
-        self.main_layout.addStretch(1)
-        self.add_navigation_buttons(show_back=False, show_next=True, next_text="Завершить", finish_text="Начать работу")
+    def reveal_widgets(self):
+        super().reveal_widgets()
+        # отдельный pop для чекмара: scale 0 -> overshoot 1.15 -> 1
+        self.check_circle.setGraphicsEffect(QGraphicsOpacityEffect(self.check_circle))
+        driver = _FrameDriver(520, QEasingCurve.Linear, self._pop_frame,
+                              on_finished=lambda: self.check_circle.setGraphicsEffect(None),
+                              parent=self)
+        self._pop_driver = driver
+        driver.start()
+
+    def _pop_frame(self, p):
+        s = spring_progress(min(1.0, p * 1.15))
+        scale = max(0.01, s)
+        size = int(110 * min(scale, 1.15))
+        self.check_circle.setFixedSize(size, size)
+        self.check_circle.setStyleSheet(
+            f"background-color: {ACCENT}; color: white;"
+            f"border-radius: {size // 2}px; font-size: {int(size * 0.49)}px; font-weight: 800;")
+        self.check_circle.graphicsEffect().setOpacity(min(1.0, p * 3))
 
 
-# Главный виджет OOBE (управляет страницами)
 class OOBEContent(QWidget):
-    # Сигнал, который отправляется, когда OOBE полностью завершено
-    oobe_finished = pyqtSignal(str, str, str) 
+    """Управляет страницами OOBE: стек + PageSwipe push/pop + точки прогресса."""
 
-    def __init__(self, parent=None, current_language="Русский", initial_navigation_mode=NAVIGATION_MODE_THREE_BUTTON, user_data_manager=None):
+    oobe_finished = pyqtSignal(str, str, str)
+
+    def __init__(self, parent=None, current_language="Русский",
+                 initial_navigation_mode=NAVIGATION_MODE_THREE_BUTTON,
+                 user_data_manager=None):
         super().__init__(parent)
         self.main_window = parent
-        self._current_language = current_language 
-        self._current_navigation_mode = initial_navigation_mode 
-        self.user_data_manager = user_data_manager 
-        self._username = "" 
+        self._current_language = current_language
+        self._current_navigation_mode = initial_navigation_mode
+        self.user_data_manager = user_data_manager
+        self._username = ""
 
-        self.setStyleSheet("background-color: #1a1a1a;") # Основной фон для OOBEContent
+        self.setStyleSheet(global_qss())
 
-        main_vlayout = QVBoxLayout(self)
-        main_vlayout.setContentsMargins(0,0,0,0)
-        main_vlayout.setSpacing(0)
+        v = QVBoxLayout(self)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(0)
 
-        # --- Индикатор прогресса ---
-        self.progress_indicator_layout = QHBoxLayout()
-        self.progress_indicator_layout.setContentsMargins(0, 15, 0, 15) # Отступы сверху/снизу
-        self.progress_indicator_layout.setSpacing(10)
-        self.progress_indicator_layout.setAlignment(Qt.AlignCenter)
-        main_vlayout.addLayout(self.progress_indicator_layout)
-
+        # --- шапка: точки прогресса + ссылка «Назад» скрыта, только точки ---
+        self.top_bar = QHBoxLayout()
+        self.top_bar.setContentsMargins(28, 22, 28, 6)
+        self.top_bar.addStretch(1)
         self.progress_dots = []
-        num_pages = 5 # Количество страниц OOBE
+        num_pages = 5
         for i in range(num_pages):
             dot = QFrame(self)
-            dot.setFixedSize(10, 10) # Размер точки
-            dot.setStyleSheet("background-color: #444; border-radius: 5px;") # Неактивная точка
+            dot.setFixedSize(8, 8)
+            dot.setStyleSheet("background-color: rgba(255,255,255,0.18); border-radius: 4px;")
             self.progress_dots.append(dot)
-            self.progress_indicator_layout.addWidget(dot)
-        
-        main_vlayout.addSpacing(10) # Отступ между индикатором и страницами
+            self.top_bar.addWidget(dot)
+            if i != num_pages - 1:
+                self.top_bar.addSpacing(8)
+        self.top_bar.addStretch(1)
+        v.addLayout(self.top_bar)
 
-        self.stacked_pages = QStackedWidget(self) 
-        main_vlayout.addWidget(self.stacked_pages, 1) # Растягиваем stacked_pages
+        self.stacked_pages = QStackedWidget(self)
+        v.addWidget(self.stacked_pages, 1)
 
-        self._create_pages()
-        self._connect_signals()
-        
-        self.stacked_pages.setCurrentIndex(0) 
-        self._update_progress_indicator(0) # Обновляем индикатор при старте
+        self.welcome_page = WelcomeLanguagePage(oobe=self, current_language=current_language)
+        self.eula_page = EULAPage(oobe=self)
+        self.user_setup_page = UserSetupPage(oobe=self)
+        self.navigation_choice_page = NavigationChoicePage(
+            oobe=self, initial_navigation_mode=initial_navigation_mode)
+        self.final_page = FinalOOBEPage(oobe=self)
 
-        # Подключаем сигнал изменения текущей страницы для обновления индикатора
-        self.stacked_pages.currentChanged.connect(self._update_progress_indicator)
+        for pg in (self.welcome_page, self.eula_page, self.user_setup_page,
+                   self.navigation_choice_page, self.final_page):
+            self.stacked_pages.addWidget(pg)
 
-    def _create_pages(self):
-        self.welcome_page = WelcomeLanguagePage(self, oobe_content_instance=self, current_language=self._current_language) 
-        self.eula_page = EULAPage(self, oobe_content_instance=self)
-        self.user_setup_page = UserSetupPage(self, oobe_content_instance=self)
-        self.navigation_choice_page = NavigationChoicePage(self, oobe_content_instance=self, initial_navigation_mode=self._current_navigation_mode)
-        self.final_page = FinalOOBEPage(self, oobe_content_instance=self)
-
-        self.stacked_pages.addWidget(self.welcome_page)
-        self.stacked_pages.addWidget(self.eula_page)
-        self.stacked_pages.addWidget(self.user_setup_page)
-        self.stacked_pages.addWidget(self.navigation_choice_page)
-        self.stacked_pages.addWidget(self.final_page)
-
-    def _connect_signals(self):
         self.welcome_page.next_page_requested.connect(self._next_page)
-
         self.eula_page.next_page_requested.connect(self._next_page)
         self.eula_page.prev_page_requested.connect(self._prev_page)
-
         self.user_setup_page.next_page_requested.connect(self._next_page)
         self.user_setup_page.prev_page_requested.connect(self._prev_page)
-        
         self.navigation_choice_page.next_page_requested.connect(self._next_page)
         self.navigation_choice_page.prev_page_requested.connect(self._prev_page)
-
         self.final_page.finish_oobe_requested.connect(self._handle_oobe_finish)
 
-    def _next_page(self):
-        current_index = self.stacked_pages.currentIndex()
-        if current_index < self.stacked_pages.count() - 1:
-            if isinstance(self.stacked_pages.widget(current_index), WelcomeLanguagePage):
-                self._current_language = self.welcome_page.get_selected_language()
-            elif isinstance(self.stacked_pages.widget(current_index), NavigationChoicePage):
-                self._current_navigation_mode = self.navigation_choice_page.get_selected_navigation_mode()
-            elif isinstance(self.stacked_pages.widget(current_index), UserSetupPage):
-                self._username = self.user_setup_page.username_input.text().strip()
+        self._swipe = PageSwipe(self.stacked_pages)
+        self.stacked_pages.setCurrentIndex(0)
+        self._animating = False
+        self._update_progress_indicator(0)
+        QTimer.singleShot(120, self.welcome_page.reveal_widgets)
 
-            self.stacked_pages.setCurrentIndex(current_index + 1)
+    def _next_page(self):
+        cur = self.stacked_pages.currentIndex()
+        if self._animating or cur >= self.stacked_pages.count() - 1:
+            return
+        self._collect_from_page(cur)
+        nxt = self.stacked_pages.widget(cur + 1)
+        self._animating = True
+        self._swipe.transition_to(nxt, direction="forward",
+                                  duration=Duration.TRANSITION,
+                                  on_finished=self._after_transition)
 
     def _prev_page(self):
-        current_index = self.stacked_pages.currentIndex()
-        if current_index > 0:
-            self.stacked_pages.setCurrentIndex(current_index - 1)
+        cur = self.stacked_pages.currentIndex()
+        if self._animating or cur <= 0:
+            return
+        prev = self.stacked_pages.widget(cur - 1)
+        self._animating = True
+        self._swipe.transition_to(prev, direction="backward",
+                                  duration=Duration.TRANSITION,
+                                  on_finished=self._after_transition)
+
+    def _after_transition(self):
+        self._animating = False
+        self._update_progress_indicator(self.stacked_pages.currentIndex())
+
+    def _collect_from_page(self, index):
+        if index == 0:
+            self._current_language = self.welcome_page.get_selected_language()
+        elif index == 2:
+            self._username = self.user_setup_page.get_username()
+        elif index == 3:
+            self._current_navigation_mode = \
+                self.navigation_choice_page.get_selected_navigation_mode()
 
     def _update_progress_indicator(self, index: int):
-        """Обновляет внешний вид точек индикатора прогресса."""
         for i, dot in enumerate(self.progress_dots):
             if i == index:
-                dot.setStyleSheet("background-color: #007AFF; border-radius: 5px;") # Активная точка синяя
+                dot.setFixedSize(22, 8)
+                dot.setStyleSheet(f"background-color: {ACCENT}; border-radius: 4px;")
+            elif i < index:
+                dot.setFixedSize(8, 8)
+                dot.setStyleSheet("background-color: rgba(255,255,255,0.45); border-radius: 4px;")
             else:
-                dot.setStyleSheet("background-color: #444; border-radius: 5px;") # Неактивная точка серая
+                dot.setFixedSize(8, 8)
+                dot.setStyleSheet("background-color: rgba(255,255,255,0.18); border-radius: 4px;")
 
-    def _handle_oobe_finish(self, selected_language, selected_navigation_mode, username):
-        self.oobe_finished.emit(selected_language, selected_navigation_mode, username)
+    def _handle_oobe_finish(self, language, nav_mode, username):
+        self._current_language = language
+        self._current_navigation_mode = nav_mode
+        self._username = username
+        self.oobe_finished.emit(language, nav_mode, username)
 
 
-# Это блок для тестирования OOBEContent отдельно (можно удалить после интеграции в Starter.py)
 if __name__ == '__main__':
     app = QApplication(sys.argv)
-    
-    # Создаем заглушки для отсутствующих иконок, если их нет
-    if not os.path.exists("icons/arrow_down_white.png"):
-        pixmap = QPixmap(20, 20)
-        pixmap.fill(QColor("transparent"))
-        painter = QPainter(pixmap)
-        painter.setPen(QColor("white"))
-        painter.drawLine(5, 8, 10, 13)
-        painter.drawLine(15, 8, 10, 13)
-        painter.end()
-        pixmap.save("icons/arrow_down_white.png")
-        print("Создана заглушка для icons/arrow_down_white.png")
-
-    if not os.path.exists("icons/arrow_up_white.png"):
-        pixmap = QPixmap(20, 20)
-        pixmap.fill(QColor("transparent"))
-        painter = QPainter(pixmap)
-        painter.setPen(QColor("white"))
-        painter.drawLine(5, 13, 10, 8)
-        painter.drawLine(15, 13, 10, 8)
-        painter.end()
-        pixmap.save("icons/arrow_up_white.png")
-        print("Создана заглушка для icons/arrow_up_white.png")
-
-    # Имитация отсутствия hixos_logo.png
-    if not os.path.exists("hixos_logo.png"):
-        print("ПРЕДУПРЕЖДЕНИЕ: hixos_logo.png не найдена. Убедитесь, что она есть в корневой папке.")
-
-
     window = QWidget()
-    window.setWindowTitle("HIXOS OOBE Test")
-    window.setGeometry(100, 100, 519, 950) 
-    window.setStyleSheet("background-color: #1a1a1a;")
-
-    class DummyUserDataManager:
-        def load_user_data(self): 
-            print("DummyDataManager: Loading dummy data (no save).")
-            return {"username": "ТестовыйПользователь", "language": "Русский", "navigation_mode": NAVIGATION_MODE_THREE_BUTTON, "system_version": "1.0.0"}
-        def save_user_data(self, data): 
-            print(f"DummyDataManager: Saving dummy data (no actual save): {data}")
-        @property
-        def user_id(self): return "test_user"
-        @user_id.setter
-        def user_id(self, new_id): 
-            print(f"DummyDataManager: User ID set to {new_id} (no actual save).")
-
-    oobe_widget = OOBEContent(window, current_language="Русский", initial_navigation_mode=NAVIGATION_MODE_THREE_BUTTON, user_data_manager=DummyUserDataManager())
-    
-    def handle_oobe_complete(lang, nav_mode, username): 
-        QMessageBox.information(window, "OOBE Завершено", f"OOBE успешно завершено!\nВыбран язык: {lang}\nРежим навигации: {nav_mode}\nИмя пользователя: {username}\nТеперь можно было бы перейти к лаунчеру.")
-        window.close() 
-
-    oobe_widget.oobe_finished.connect(handle_oobe_complete)
-
-    layout = QVBoxLayout(window)
-    layout.addWidget(oobe_widget)
+    window.setWindowTitle("HIXOS OOBE v2")
+    window.setGeometry(100, 100, 480, 900)
+    oobe = OOBEContent(window)
+    oobe.oobe_finished.connect(lambda l, n, u: (
+        QMessageBox.information(window, "OOBE завершено",
+                                f"Язык: {l}\nНавигация: {n}\nПользователь: {u}"),
+        window.close()))
+    lay = QVBoxLayout(window)
+    lay.setContentsMargins(0, 0, 0, 0)
+    lay.addWidget(oobe)
     window.show()
     sys.exit(app.exec_())

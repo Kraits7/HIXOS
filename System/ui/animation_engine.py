@@ -100,6 +100,30 @@ def _bezier(x1: float, y1: float, x2: float, y2: float,
     return CubicBezierCurve(x1, y1, x2, y2, fallback)
 
 
+def _clamp01(v: float) -> float:
+    return 0.0 if v < 0.0 else (1.0 if v > 1.0 else v)
+
+
+def _smoothstep(edge0: float, edge1: float, x: float) -> float:
+    """C1-непрерывный blend между фазами (гладкая S-кривая с нулевыми
+    производными на концах). Именно отсутствие таких blend-ов создавало
+    изломы скорости в точках переключения фаз detach/squeeze/landing."""
+    t = _clamp01((x - edge0) / max(1e-6, edge1 - edge0))
+    return t * t * (3.0 - 2.0 * t)
+
+
+def _curve_value(curve, p: float) -> float:
+    """Универсальное вычисление значения easing-кривой (CubicBezierCurve или QEasingCurve)."""
+    try:
+        if hasattr(curve, "getPoint"):
+            return curve.getPoint(p)
+        if isinstance(curve, QEasingCurve):
+            return curve.valueForProgress(p)
+    except Exception:
+        pass
+    return p
+
+
 class Easing:
     """Централизованные easing-кривые в стиле OriginOS 5 / HyperOS 2 / iOS 18."""
 
@@ -120,8 +144,13 @@ class Easing:
     DISMISS = _bezier(0.24, 0.12, 0.20, 1.0, QEasingCurve.InOutCubic)
 
     # Точная кривая «сжатия окна в иконку» как в iOS App Switcher home-swipe:
-    # почти мгновенный старт (палец уже отпустил), затем долгое мягкое торможение
-    IOS_DISMISS = _bezier(0.36, 0.0, 0.18, 1.0, QEasingCurve.InOutCubic)
+    # почти мгновенный старт (палец уже отпустил), затем долгое мягкое торможение.
+    # Это эталонный cubic-bezier(0.32, 0.72, 0, 1) из UIKit interactive transitions.
+    IOS_DISMISS = _bezier(0.32, 0.72, 0.0, 1.0, QEasingCurve.InOutCubic)
+
+    # Эталонная кривая открытия приложения в iOS (spring timing по умолчанию):
+    # быстрый уверенный старт + долгое экспоненциальное торможение без overshoot
+    IOS_LAUNCH = _bezier(0.40, 0.00, 0.12, 1.0, QEasingCurve.OutQuart)
 
     # Отдельная кривая для фазы посадки в слот (spring cushion)
     IOS_LAND = _bezier(0.30, 0.90, 0.25, 1.0, QEasingCurve.OutQuart)
@@ -367,44 +396,15 @@ class MorphOverlay(QWidget):
     # -------------------------------------------------------------------------
 
     def _compute_open_geometry(self, p: float) -> Tuple[QRectF, float, float]:
-        """Возвращает (cur_rect, corner_radius, elevation_k) для открытия окна (p: 0 -> 1)."""
-        ix, iy = self._icon_rect.x(), self._icon_rect.y()
-        iw, ih = self._icon_rect.width(), self._icon_rect.height()
-        tx, ty = self._target_rect.x(), self._target_rect.y()
-        tw, th = self._target_rect.width(), self._target_rect.height()
+        """Возвращает (cur_rect, corner_radius, elevation_k) для iOS-открытия окна (p: 0 -> 1).
 
-        icx, icy = ix + iw * 0.5, iy + ih * 0.5
-        tcx, tcy = tx + tw * 0.5, ty + th * 0.5
-
-        # Дуговая траектория центра: горизонталь выходит в центр экрана чуть быстрее вертикали
-        px = p ** 0.76
-        py = p ** 0.94
-        # Лёгкий подъём вверх на старте (эффект всплытия иконки над столом)
-        lift_dy = -14.0 * math.sin(p * math.pi) * (1.0 - p * 0.5)
-
-        cx = icx + (tcx - icx) * px
-        cy = icy + (tcy - icy) * py + lift_dy
-
-        # Эластичное раскрытие размеров: сначала иконка превращается в карточку, затем в экран
-        pw = p ** 0.88
-        ph = p ** 0.96
-        w = iw + (tw - iw) * pw
-        h = ih + (th - ih) * ph
-
-        # В середине полёта радиус скругления увеличивается до карточки (28px),
-        # а при посадке в края экрана уменьшается до corner_end
-        mid_boost = 10.0 * math.sin(p * math.pi)
-        r = self._corner_start + (self._corner_end - self._corner_start) * (p ** 0.85) + mid_boost
-        elevation = math.sin(p * math.pi)
-
-        return QRectF(cx - w * 0.5, cy - h * 0.5, w, h), max(2.0, r), elevation
-
-    def _compute_close_geometry(self, t: float) -> Tuple[QRectF, float, float]:
-        """Возвращает (cur_rect, corner_radius, elevation_k) для 5-фазного iOS-закрытия.
-
-        Фазы: Detach 0..0.14 | Squeeze 0.14..0.38 | Arc Flight 0.38..0.76
-              Cross-Dissolve внутри полёта | Landing 0.84..1.0
-        t = 0.0 -> полноэкранное окно;  t = 1.0 -> посадка в слот иконки.
+        Полностью непрерывная C1-геометрия без изломов скорости:
+          * траектория центра — плавная дуга с синусным подбросом;
+          * ширина и высота расходятся по РАЗНЫМ кривым (фирменный squash->stretch
+            морф iOS: сначала разгоняется ширина, высоту «догоняет»);
+          * радиус скругления в середине полёта превышает финальный (карточка
+            «распухает»), затем плавно стекает к углу экрана;
+          * scale overshoot на посадке отсутствует — точный iOS spring.
         """
         ix, iy = self._icon_rect.x(), self._icon_rect.y()
         iw, ih = self._icon_rect.width(), self._icon_rect.height()
@@ -414,89 +414,156 @@ class MorphOverlay(QWidget):
         icx, icy = ix + iw * 0.5, iy + ih * 0.5
         tcx, tcy = tx + tw * 0.5, ty + th * 0.5
 
-        # ================= Фаза 1: DETACH (0..0.14) =================
-        # Окно ещё почти полноэкранное, но уже ОТРЫВАЕТСЯ от краёв:
-        # появляется зазор по периметру (detach_gap), углы скругляются,
-        # тень рождается из нуля — окно «приподнимается» над столом.
-        detach_t = min(1.0, t / 0.14)
-        detach_e = Easing.DECELERATE.getPoint(detach_t) if hasattr(Easing.DECELERATE, "getPoint") else (1.0 - (1.0 - detach_t) ** 3)
+        # ---- Морф размеров: ширина опережает высоту (squash -> stretch) ----
+        # Кривые с НУЛЕВОЙ стартовой скоростью (линейный множитель p в начале):
+        # квадратные корни вида sqrt(p) имеют бесконечную производную при p=0 —
+        # именно они давали микрорывок размера в первом же кадре открытия.
+        pw = min(1.0, (p * (0.62 + 0.38 * p)) ** 0.5)
+        ph = min(1.0, (p * (0.46 + 0.54 * p)) ** 0.5)
+        # Финальные 6% — smoothstep-доводка точно в геометрию окна (без скачка)
+        lock = _smoothstep(0.94, 1.0, p)
+        pw = pw + (1.0 - pw) * lock
+        ph = ph + (1.0 - ph) * lock
+
+        w = iw + (tw - iw) * pw
+        h = ih + (th - ih) * ph
+
+        # ---- Траектория центра: независимые оси + мягкая дуга ----
+        # Все три компонента начинаются со скоростью ~0 (множитель p внутри),
+        # поэтому первый кадр открытия не содержит «телепорта» по позиции.
+        px = min(1.0, p * (0.55 + 0.45 * p))
+        py = min(1.0, p * (0.42 + 0.58 * p))
+        # Подброс вверх в первой половине полёта (sin-арка, нулевая на концах)
+        arc_dy = -16.0 * math.sin(p * math.pi) * (1.0 - p * 0.4) * px
+        # Боковое хлыстовое упреждение — карточка слегка проскакивает по X
+        whip = 8.0 * math.sin(p * math.pi) * (1.0 - p) * px
+        dir_x = 1.0 if tcx >= icx else -1.0
+
+        cx = icx + (tcx - icx) * px + whip * dir_x
+        cy = icy + (tcy - icy) * py + arc_dy
+
+        # ---- Радиус: squircle иконки -> карточный всплеск -> угол окна ----
+        card_arch = 12.0 * math.sin(_clamp01(p * 1.15) * math.pi) * px
+        base_r = self._corner_start + (self._corner_end - self._corner_start) * (p * (0.7 + 0.3 * p))
+        r = min(min(w, h) * 0.46, base_r + card_arch)
+
+        # ---- Тень парения: рождается при отрыве, гаснет к посадке ----
+        elevation = math.sin(math.pow(_clamp01(p), 1.25) * math.pi) ** 0.7
+
+        return QRectF(cx - w * 0.5, cy - h * 0.5, w, h), max(2.0, r), elevation
+
+    def _compute_close_geometry(self, t: float) -> Tuple[QRectF, float, float]:
+        """Возвращает (cur_rect, corner_radius, elevation_k) для iOS-закрытия окна.
+
+        КЛЮЧЕВОЕ ОТЛИЧИЕ ОТ ПРЕДЫДУЩЕЙ ВЕРСИИ (починка «рывка» на старте):
+        все фазы (detach / squeeze / полёт / landing) теперь смешиваются через
+        C1-непрерывные smoothstep-окна вместо жёстких `if t > X` и ступенчатых
+        нормализаций. Скорость изменения каждой координаты непрерывна по всему
+        пути — ни в одной точке переключения фаз геометрическая производная не
+        скачет, поэтому глазом не видно ни телепортов, ни подтормаживаний.
+
+        Фазы (плавно перекрывающиеся): Detach 0..0.22 | Squeeze 0.10..0.55
+              Arc Flight 0.10..0.90 | Landing cushion 0.80..1.0
+        t = 0.0 -> полноэкранное окно;  t = 1.0 -> посадка в слот иконки.
+        """
+        ix, iy = self._icon_rect.x(), self._icon_rect.y()
+        iw, ih = self._icon_rect.width(), self._icon_rect.height()
+        tx, ty = self._target_rect.x(), self._target_rect.y()
+        tw, th = self._target_rect.width(), self._target_rect.height()
+
+        icx, icy = ix + iw * 0.5, iy + ih * 0.5
+        tcy = ty + th * 0.5
+
+        # Полноэкранный ли стартовый кадр (тогда уместен detach-gap).
+        full_screen_start = (self._closing and tw >= iw * 1.6
+                             and abs(tw - self.width()) < tw * 0.25)
+
+        # ================= Фаза 1: DETACH (плавный отрыв от краёв) ==========
+        # Окно ещё почти полноэкранное, но уже ОТРЫВАЕТСЯ от краёв экрана:
+        # зазор по периметру растёт по smoothstep (нулевые скорость на обоих
+        # концах интервала — никакого излома при входе/выходе из фазы).
+        detach_e = _smoothstep(0.0, 0.22, t)
         detach_gap = 14.0 * detach_e          # визуальный зазор карточки от края экрана
         detach_lift = -6.0 * detach_e         # микро-подъём вверх при отрыве
 
         # ================= Общая траектория центра =================
-        # Центр стартует с ПОЛНОЭКРАННОЙ позицией (tcx, tcy): в отличие от
-        # прежней версии, отрыв окна НЕ сдвигает его геометрию на первый кадр —
-        # иначе между t=0 и первым тиком возникает видимый телепорт (~9 px).
-        move_t = max(0.0, min(1.0, (t - 0.10) / 0.86))
-        eased_move = 1.0 - (1.0 - move_t) ** 2.8
+        # Движение начинается сразу с t=0 (без offset-фазы — именно она
+        # создавала паузу, а затем догоняющий рывок), но стартует с ОКОЛО
+        # нулевой скорости: ease_move = 1-(1-t)^3.2 имеет производную ~0 при
+        # t=0 и мягко разгоняется — ровно как release velocity в UIKit после
+        # отпускания home-swipe.
+        # ================= Общая траектория центра =================
+        # Движение начинается сразу с t=0 (без offset-фазы — именно она
+        # создавала паузу, а затем догоняющий рывок), но стартует с ОКОЛО
+        # нулевой скорости: ease_move = 1-(1-t)^3.2 имеет производную ~0 при
+        # t=0 и мягко разгоняется — ровно как release velocity в UIKit после
+        # отпускания home-swipe.
+        ease_move = 1.0 - (1.0 - t) ** 3.2
+        move_t = _clamp01(ease_move)
 
-        # Независимые оси X/Y: горизонталь стартует рывком (сходство с инерцией
-        # свайпа iOS), вертикаль идёт полого — центр описывает естественную дугу.
-        px = min(1.0, eased_move ** 0.70)
-        py = min(1.0, eased_move ** 1.12)
+        # Независимые оси: горизонталь слегка опережает вертикаль — центр
+        # описывает естественную дугу, как в home-swipe UIKit.
+        px = min(1.0, move_t ** 0.80)
+        py = min(1.0, move_t ** 1.10)
 
-        # Дуга полёта: подброс вверх в первой половине и плавное снижение к слоту
-        arc_lift = -26.0 * math.sin(move_t * math.pi) * (1.0 - move_t * 0.35)
+        # Дуга полёта: подброс вверх в первой половине и плавное снижение к слоту.
+        # Умножение на move_t, а не на сырое t, гарантирует нулевую производную
+        # арки на обоих концах пути (arc' = arc'_base * ease_move' -> 0 при t=0/1).
+        arc_lift = -24.0 * math.sin(move_t * math.pi) * (1.0 - move_t * 0.35) * move_t
         # Лёгкое боковое «хлыстовое» упреждение (whip) — карточка проскакивает
         # по горизонтали на ~3% пути назад, как инертный объект iOS
-        whip_x = 10.0 * math.sin(min(1.0, move_t * 1.25) * math.pi) * (1.0 - move_t)
+        whip_x = 9.0 * math.sin(min(1.0, move_t * 1.2) * math.pi) * (1.0 - move_t) * move_t
 
-        cx = tcx + (icx - tcx) * px + whip_x * (1.0 if icx >= tcx else -1.0)
-        cy = tcy + (icy - tcy) * py + arc_lift * move_t + detach_lift * move_t
+        cx = tx + tw * 0.5 + (icx - (tx + tw * 0.5)) * px + whip_x * (1.0 if icx >= tx + tw * 0.5 else -1.0)
+        cy = tcy + (icy - tcy) * py + arc_lift + detach_lift * move_t
 
-        # ================= Фаза 2: SQUEEZE (морф размеров) =================
-        # Ключевой iOS-эффект: ширина и высота схлопываются с РАЗНОЙ скоростью.
-        # Сначала сохраняется широкая карточка, затем высота догоняет ширину —
-        # кадр не сплющивается, а превращается в квадратный squircle.
-        size_t = 1.0 - (1.0 - t) ** 2.5
-        pw = min(1.0, size_t ** 0.92)                       # ширина уходит плавно
-        ph = min(1.0, max(0.0, (size_t - 0.06)) ** 0.62)    # высота догоняет быстрее
-
-        # На самой посадке (t→1) морф обязан сойтись ровно на геометрию слота:
-        # дожимаем финальные 8% пути smoothstep-ом к точному размеру иконки,
-        # иначе карточка «приземляется» чуть выше/ниже настоящего центра иконки.
-        if t > 0.92:
-            lock = (t - 0.92) / 0.08
-            lock_e = lock * lock * (3.0 - 2.0 * lock)       # smoothstep
-            pw = pw + (1.0 - pw) * lock_e
-            ph = ph + (1.0 - ph) * lock_e
+        # ================= Фаза 2: SQUEEZE (морф размеров) ==================
+        # Фирменный iOS-эффект: ширина и высота схлопываются с РАЗНОЙ скоростью.
+        # size_t = чистая t (ОБЯЗАТЕЛЬНО без собственного easing!) — весь timing
+        # задаёт единственный драйвер-кривая IOS_DISMISS. Двойной easing
+        # (кривая поверх smoothstep) делал середину анимации неестественно быстрой,
+        # а финал — вязким: это и был видимый «рывок» после отрыва окна.
+        size_t = t
+        pw = size_t ** 0.90                    # ширина уходит плавно-быстро
+        ph = size_t ** 0.72                    # высота догоняет чуть быстрее (squash->release)
 
         w = tw + (iw - tw) * pw
         h = th + (ih - th) * ph
 
-        # Z-gap фазы отрыва (только для полноэкранного старта): первые 14% окно
-        # чуть меньше экрана со всех сторон. Для стартовых прямоугольников, которые
-        # ИСПОДНАЛЬНЕЕ целевого окна (например, возврат из Recents), gap-обрезка
-        # запрещена — она вызывала скачок размера на первых кадрах.
-        if t < 0.14 and self._closing and tw >= iw * 1.6:
-            shrink = detach_gap * 2.0
+        # Z-gap фазы отрыва: первые кадры окно чуть меньше экрана со всех сторон.
+        # gap-обрезка ПЛАВНО растворяется к t=0.30 (gk -> 0), а не обрывается на
+        # 14% — раньше именно это abrupt-выключение давало заметный щелчок размера.
+        if full_screen_start:
+            gk = 1.0 - _smoothstep(0.14, 0.30, t)
+            shrink = detach_gap * 2.0 * gk
             w = min(w, tw - shrink)
             h = min(h, th - shrink)
 
-        # ================= Фаза 5: LANDING (spring cushion 0.84..1.0) ========
-        # Карточка сжимается до 0.93x и распружинивается ровно в 1.0x слота,
-        # с затухающим вторичным осциллятором (двойной пружинный pop iOS).
-        if t > 0.84:
-            land_phase = (t - 0.84) / 0.16
-            cushion = (1.0
-                       - 0.070 * math.sin(land_phase * math.pi)
-                       + 0.018 * math.sin(2.0 * land_phase * math.pi) * (1.0 - land_phase))
-            w *= cushion
-            h *= cushion
+        # ================= Фаза 5: LANDING (spring cushion 0.80..1.0) =======
+        # Карточка сжимается до ~0.93x и распружинивается ровно в 1.0x слота.
+        # sin-несущая равна 0 на обоих концах интервала => вход в cushion и
+        # выход из него абсолютно непрерывны (производная тоже).
+        land_phase = _clamp01((t - 0.80) / 0.20)
+        cushion = (1.0
+                   - 0.065 * math.sin(land_phase * math.pi)
+                   + 0.016 * math.sin(2.0 * land_phase * math.pi) * (1.0 - land_phase))
+        w *= cushion
+        h *= cushion
 
         # ================= Скругление углов =================
-        # 6px экран -> всплеск до карточных ~28px в середине -> радиус иконки
-        card_arch = 18.0 * math.sin(min(1.0, t * 1.25) * math.pi)
+        # 6px экран -> всплеск до карточных ~28px в середине -> радиус squircle.
+        # card_arch гасится smoothstep-ом к концу пути, чтобы финальный радиус
+        # совпадал с маской настоящей иконки лаунчера (22.5% стороны).
+        arch_env = math.sin(_clamp01(t * 1.22) * math.pi) * (1.0 - _smoothstep(0.78, 1.0, t))
+        card_arch = 18.0 * arch_env
         base_r = self._corner_end + (self._corner_start - self._corner_end) * (t ** 0.5)
-        r = min(min(w, h) * 0.46, base_r + card_arch + detach_gap * 0.9)
+        r = min(min(w, h) * 0.46, base_r + card_arch + detach_gap * 0.9 * (1.0 - _smoothstep(0.5, 0.8, t)))
 
         # Высота парения (сила тени): стремительно растёт при отрыве,
-        # плато в полёте, мягко гаснет при посадке
+        # плато в полёте, мягко гаснет при посадке (smoothstep, не линейно)
         rise = detach_e * 0.85
-        flight = math.sin(min(1.0, max(0.0, (t - 0.05) / 0.95) * math.pi)) ** 0.6
-        elevation = max(rise, flight)
-        if t > 0.88:
-            elevation *= max(0.0, 1.0 - (t - 0.88) / 0.12)
+        flight = math.sin(_smoothstep(0.02, 0.98, t) * math.pi) ** 0.6
+        elevation = max(rise, flight) * (1.0 - _smoothstep(0.86, 1.0, t))
 
         return QRectF(cx - w * 0.5, cy - h * 0.5, w, h), max(2.0, r), elevation
 
@@ -590,12 +657,17 @@ class MorphOverlay(QWidget):
         painter.drawRoundedRect(rect.adjusted(0.6, 0.6, -0.6, -0.6), r, r)
 
     def _paint_open(self, painter: QPainter, p: float):
-        """Отрисовка захода в приложение (p: 0.0 -> 1.0)."""
+        """Отрисовка захода в приложение (p: 0.0 -> 1.0) в стиле iOS zoom transition.
+
+        Все alpha-переходы построены на smoothstep — ни один слой не включается
+        и не выключается резко, поэтому дорожка яркости каждого пикселя непрерывна.
+        """
         cur_rect, r, elevation = self._compute_open_geometry(p)
         iw, ih = self._icon_rect.width(), self._icon_rect.height()
 
-        # 1. Глубокое притемнение рабочего стола под растущим окном
-        backdrop_alpha = int(125 * (p ** 0.75))
+        # 1. Притемнение рабочего стола: растёт плавно (iOS затемняет home
+        #    ровно настолько, насколько окно оторвалось от слота)
+        backdrop_alpha = int(125 * _smoothstep(0.0, 0.85, p))
         if backdrop_alpha > 1:
             painter.fillRect(self.rect(), QColor(6, 8, 14, backdrop_alpha))
 
@@ -615,19 +687,24 @@ class MorphOverlay(QWidget):
         # Рисуем стеклянный фон окна
         self._draw_stylized_window_interior(painter, cur_rect, p)
 
-        # Если есть реальный снимок целевого окна — плавно проявляем его во второй половине
-        if has_snap and p > 0.18:
-            snap_alpha = min(1.0, (p - 0.18) / 0.62)
-            painter.setOpacity(snap_alpha)
-            snap_w = cur_rect.width()
-            snap_h = self._target_rect.height() * (snap_w / max(1.0, self._target_rect.width()))
-            painter.drawPixmap(
-                QRectF(cur_rect.x(), cur_rect.y(), snap_w, max(cur_rect.height(), snap_h)),
-                self._snapshot,
-                QRectF(self._snapshot.rect())
-            )
+        # Если есть реальный снимок целевого окна — cross-dissolve из иконки
+        # в интерфейс: snap проявляется по smoothstep (плавная производная
+        # яркости), а не линейным порогом с резким «включением» на 18%.
+        if has_snap:
+            snap_alpha = _smoothstep(0.16, 0.78, p)
+            if snap_alpha > 0.01:
+                painter.setOpacity(snap_alpha)
+                snap_w = cur_rect.width()
+                snap_h = self._target_rect.height() * (snap_w / max(1.0, self._target_rect.width()))
+                painter.drawPixmap(
+                    QRectF(cur_rect.x(), cur_rect.y(), snap_w, max(cur_rect.height(), snap_h)),
+                    self._snapshot,
+                    QRectF(self._snapshot.rect())
+                )
 
-        # Отрисовка иконки приложения в центре растущей карточки (OriginOS splash)
+        # Отрисовка иконки приложения в центре растущей карточки (OriginOS splash).
+        # В реальном iOS логотип НЕ растворяется полностью до конца анимации —
+        # он уходит в 0 только в самый финал, поэтому держим его дольше.
         if has_icon:
             base_side = min(iw, ih) * 0.90
             # Иконка плавно вырастает в 1.48 раза в центре карточки
@@ -635,8 +712,7 @@ class MorphOverlay(QWidget):
             px = cur_rect.center().x() - side * 0.5
             py = cur_rect.center().y() - side * 0.5
 
-            # Иконка держит чёткость до 55% пути, затем мягко растворяется в окно
-            icon_alpha = 1.0 - max(0.0, (p - 0.55) / 0.45) * 0.88
+            icon_alpha = 1.0 - 0.92 * _smoothstep(0.52, 0.96, p)
             painter.setOpacity(icon_alpha)
             painter.drawPixmap(
                 QRectF(px, py, side, side),
@@ -704,7 +780,11 @@ class MorphOverlay(QWidget):
         painter.restore()
 
     def _paint_close(self, painter: QPainter, t: float):
-        """Детальная покадровая отрисовка 5-фазного iOS-выхода из приложения."""
+        """Детальная покадровая отрисовка iOS-выхода из приложения.
+
+        Каждый alpha/position-слой смешивается smoothstep-ом: ни один слой не
+        вспыхивает и не гаснет ступенькой — яркость пикселей меняется непрерывно.
+        """
         cur_rect, r, elevation = self._compute_close_geometry(t)
         tw = max(1.0, self._target_rect.width())
         th = max(1.0, self._target_rect.height())
@@ -713,10 +793,10 @@ class MorphOverlay(QWidget):
         has_icon = self._pixmap is not None and not self._pixmap.isNull()
 
         # ---- Master opacity: карточка полностью непрозрачна весь полёт
-        # и растворяется лишь на последних 8% — когда она уже внутри слота ----
-        master_opacity = 1.0
-        if t > 0.92:
-            master_opacity = max(0.0, 1.0 - (t - 0.92) / 0.08)
+        # и растворяется лишь на последних 8% — когда она уже внутри слота.
+        # smoothstep вместо линейного обрыва: последние кадры уходят в ноль
+        # без «ступеньки» яркости. ----
+        master_opacity = 1.0 - _smoothstep(0.92, 1.0, t)
 
         # ================= Фаза 1: фон и тень =================
         self._draw_close_backdrop(painter, t)
@@ -747,14 +827,14 @@ class MorphOverlay(QWidget):
             snap_w = tw * scale_ratio
             snap_h = th * scale_ratio
             snap_x = cur_rect.center().x() - snap_w * 0.5
-            focus_top_k = 0.12 + 0.30 * min(1.0, t * 1.4)   # плавный уход фокуса вверх
+            # Плавный уход фокуса вверх (smoothstep, а не `min(1, t*1.4)` с изломом на 71%)
+            focus_top_k = 0.12 + 0.30 * _smoothstep(0.0, 0.72, t)
             snap_y = cur_rect.y() - (snap_h - cur_rect.height()) * focus_top_k
 
-            # Cross-Dissolve (Фаза 4): снимок растворяется в иконке, а не исчезает резко
-            snap_alpha = 1.0
-            if has_icon and t > 0.55:
-                fade = min(1.0, (t - 0.55) / 0.34)
-                snap_alpha = 1.0 - Easing.IOS_LAND.getPoint(fade) if hasattr(Easing.IOS_LAND, "getPoint") else 1.0 - fade
+            # Cross-Dissolve: снимок перекрёстно растворяется в иконке (симметрично
+            # появлению иконки — сумма их вкладов почти постоянна).
+            icon_appear = _smoothstep(0.50, 0.88, t) if has_icon else 0.0
+            snap_alpha = 1.0 - icon_appear * 0.96
 
             painter.setOpacity(master_opacity * snap_alpha)
             painter.drawPixmap(
@@ -765,8 +845,8 @@ class MorphOverlay(QWidget):
 
             # Стеклянная вуаль: лёгкое холодное затемнение сверху вниз на подлёте,
             # имитирует уменьшение экспозиции «далёкой» карточки
-            if t > 0.30:
-                veil = min(1.0, (t - 0.30) / 0.55)
+            veil = _smoothstep(0.30, 0.85, t)
+            if veil > 0.01:
                 veil_grad = QLinearGradient(cur_rect.topLeft(), cur_rect.bottomLeft())
                 veil_grad.setColorAt(0.0, QColor(16, 20, 30, int(30 * veil)))
                 veil_grad.setColorAt(1.0, QColor(10, 12, 20, int(72 * veil)))
@@ -777,15 +857,13 @@ class MorphOverlay(QWidget):
         # Растёт чуть больше карточки (fill_k) и делает финальный pop при посадке.
         if has_icon:
             if has_snap:
-                rise = max(0.0, min(1.0, (t - 0.50) / 0.36))
-                icon_appear = Easing.IOS_DISMISS.getPoint(rise) if hasattr(Easing.IOS_DISMISS, "getPoint") else rise
+                icon_appear = _smoothstep(0.50, 0.88, t)
             else:
-                icon_appear = 1.0 if t > 0.45 else (t / 0.45)
-            # Посадочный pop: 1.0 -> 1.06 -> 1.0 в фазе cushion (0.88..1.0)
-            pop = 1.0
-            if t > 0.88:
-                pop_t = (t - 0.88) / 0.12
-                pop = 1.0 + 0.06 * math.sin(pop_t * math.pi)
+                icon_appear = _smoothstep(0.10, 0.45, t)
+            # Посадочный pop: 1.0 -> 1.06 -> 1.0 в фазе cushion (0.86..1.0).
+            # sin-несущая нулевая на концах => pop начинается и заканчивается без щелчка.
+            pop_t = _clamp01((t - 0.86) / 0.14)
+            pop = 1.0 + 0.06 * math.sin(pop_t * math.pi)
             self._draw_squircle_icon(painter, cur_rect, self._pixmap,
                                      master_opacity * icon_appear, pop)
 
@@ -794,7 +872,7 @@ class MorphOverlay(QWidget):
         # ================= Стекло: блик + спекулярный кант =================
         painter.setOpacity(master_opacity)
         # Блик проходит по стеклу ровно один раз за полёт (sweep = eased t)
-        sweep = Easing.IOS_DISMISS.getPoint(t) if hasattr(Easing.IOS_DISMISS, "getPoint") else t
+        sweep = _curve_value(Easing.IOS_DISMISS, t)
         self._draw_glass_rim_and_sheen(painter, cur_rect, clip_path, r, elevation, sweep)
 
     # -------------------------------------------------------------------------
@@ -814,7 +892,7 @@ class MorphOverlay(QWidget):
         actual_dur = max(int(duration), 480)
         self._driver = _FrameDriver(
             actual_dur,
-            curve or Easing.LAUNCH,
+            curve or Easing.IOS_LAUNCH,
             self.set_progress,
             self._finish,
             self

@@ -1,0 +1,880 @@
+<!DOCTYPE html>
+<html lang="ru" class="scroll-smooth dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>HIXOS — Симулятор мобильной ОС на Python & PyQt5</title>
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Font Awesome Icons -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <!-- Google Fonts: Inter & Outfit for modern fluid UI -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500&family=Outfit:wght@300;400;500;600;700;800&family=Plus+Jakarta+Sans:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+    
+    <script>
+        tailwind.config = {
+            darkMode: 'class',
+            theme: {
+                extend: {
+                    colors: {
+                        fluid: {
+                            purple: '#a855f7',
+                            pink: '#ec4899',
+                            cyan: '#06b6d4',
+                            blue: '#3b82f6',
+                            card: 'rgba(255, 255, 255, 0.05)',
+                            cardBorder: 'rgba(255, 255, 255, 0.12)',
+                        }
+                    },
+                    fontFamily: {
+                        sans: ['Plus Jakarta Sans', 'Inter', 'sans-serif'],
+                        outfit: ['Outfit', 'sans-serif'],
+                        mono: ['Fira Code', 'monospace'],
+                    },
+                    animation: {
+                        'blob-spin': 'blob 12s infinite linear',
+                        'float': 'float 4s ease-in-out infinite',
+                        'pulse-glow': 'pulseGlow 3s ease-in-out infinite',
+                    },
+                    keyframes: {
+                        blob: {
+                            '0%': { transform: 'rotate(0deg) scale(1)' },
+                            '50%': { transform: 'rotate(180deg) scale(1.15)' },
+                            '100%': { transform: 'rotate(360deg) scale(1)' },
+                        },
+                        float: {
+                            '0%, 100%': { transform: 'translateY(0px)' },
+                            '50%': { transform: 'translateY(-10px)' },
+                        },
+                        pulseGlow: {
+                            '0%, 100%': { opacity: '0.4' },
+                            '50%': { opacity: '0.8' },
+                        }
+                    }
+                }
+            }
+        }
+    </script>
+    <style>
+        /* Modern Fluid UI Styles & Glassmorphism */
+        .glass-fluid {
+            background: rgba(18, 24, 38, 0.6);
+            backdrop-filter: blur(20px);
+            -webkit-backdrop-filter: blur(20px);
+            border: 1px solid rgba(255, 255, 255, 0.12);
+            box-shadow: 0 20px 50px rgba(0, 0, 0, 0.4);
+        }
+        
+        .glass-phone {
+            background: rgba(10, 15, 29, 0.85);
+            backdrop-filter: blur(25px);
+            -webkit-backdrop-filter: blur(25px);
+            border: 1px solid rgba(255, 255, 255, 0.18);
+        }
+
+        .fluid-gradient-text {
+            background: linear-gradient(135deg, #a855f7 0%, #ec4899 50%, #06b6d4 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+
+        .fluid-border {
+            position: relative;
+        }
+        .fluid-border::before {
+            content: '';
+            position: absolute;
+            inset: -1px;
+            border-radius: inherit;
+            padding: 1px;
+            background: linear-gradient(135deg, rgba(168,85,247,0.5), rgba(236,72,153,0.2), rgba(6,182,212,0.5));
+            -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+            -webkit-mask-composite: xor;
+            mask-composite: exclude;
+            pointer-events: none;
+        }
+
+        /* Smooth Physics Spring Transition Simulation */
+        .spring-transition {
+            transition: all 0.5s cubic-bezier(0.34, 1.56, 0.64, 1);
+        }
+
+        .phone-app-card {
+            transition: transform 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275), box-shadow 0.3s ease;
+        }
+        .phone-app-card:hover {
+            transform: translateY(-4px) scale(1.05);
+        }
+
+        /* Phone Screen Wallpapers */
+        .wp-fluid-1 { background: radial-gradient(circle at 20% 20%, #7e22ce 0%, #1e1b4b 60%, #0f172a 100%); }
+        .wp-fluid-2 { background: radial-gradient(circle at 80% 20%, #0284c7 0%, #0f172a 60%, #020617 100%); }
+        .wp-fluid-3 { background: radial-gradient(circle at 50% 80%, #be185d 0%, #31102f 60%, #090d16 100%); }
+
+        /* Hide scrollbars for clean UI */
+        .no-scrollbar::-webkit-scrollbar { display: none; }
+        .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+    </style>
+</head>
+<body class="bg-slate-950 text-slate-100 font-sans antialiased overflow-x-hidden selection:bg-fluid-pink selection:text-white">
+
+    <!-- Fluid Dynamic Ambient Background -->
+    <div class="fixed inset-0 pointer-events-none z-0 overflow-hidden">
+        <div class="absolute -top-32 -left-32 w-[500px] h-[500px] bg-gradient-to-br from-fluid-purple/30 to-fluid-pink/20 rounded-full blur-[120px] animate-blob-spin"></div>
+        <div class="absolute top-1/2 -right-40 w-[600px] h-[600px] bg-gradient-to-tl from-fluid-cyan/25 to-blue-600/15 rounded-full blur-[140px] animate-blob-spin" style="animation-delay: -5s;"></div>
+        <div class="absolute -bottom-40 left-1/3 w-[550px] h-[550px] bg-gradient-to-tr from-purple-900/30 to-fluid-pink/15 rounded-full blur-[130px] animate-blob-spin" style="animation-delay: -9s;"></div>
+    </div>
+
+    <!-- Header Navigation -->
+    <header class="sticky top-0 z-50 glass-fluid border-b border-slate-800/60">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+            <div class="flex items-center justify-between h-16">
+                
+                <!-- Logo & Brand -->
+                <a href="#" class="flex items-center gap-3 group">
+                    <div class="w-10 h-10 rounded-2xl bg-white p-1.5 flex items-center justify-center shadow-lg shadow-fluid-purple/20 group-hover:scale-105 transition-transform duration-300">
+                        <img src="https://raw.githubusercontent.com/Kraits7/HIXOS/refs/heads/main/System/Icons/hixos_logo.png" 
+                             alt="HIXOS Logo" 
+                             class="max-w-full max-h-full object-contain"
+                             onerror="this.src='https://placehold.co/100x100/ffffff/a855f7?text=HIXOS'">
+                    </div>
+                    <div class="flex flex-col">
+                        <span class="font-outfit font-extrabold text-xl tracking-wider text-white group-hover:text-fluid-pink transition-colors">HIXOS</span>
+                        <span class="text-[10px] font-mono text-fluid-cyan tracking-widest -mt-1 uppercase">Mobile OS Engine</span>
+                    </div>
+                </a>
+
+                <!-- Desktop Navigation Links -->
+                <nav class="hidden md:flex items-center gap-8 text-sm font-medium text-slate-300">
+                    <a href="#simulator" class="hover:text-fluid-pink transition-colors flex items-center gap-2">
+                        <i class="fa-solid fa-mobile-screen-button text-xs text-fluid-purple"></i> Симулятор
+                    </a>
+                    <a href="#animations" class="hover:text-fluid-pink transition-colors flex items-center gap-2">
+                        <i class="fa-solid fa-wand-magic-sparkles text-xs text-fluid-pink"></i> Fluid Анимации
+                    </a>
+                    <a href="#tech" class="hover:text-fluid-pink transition-colors flex items-center gap-2">
+                        <i class="fa-brands fa-python text-xs text-amber-400"></i> PyQt5 / Web Engine
+                    </a>
+                    <a href="#quickstart" class="hover:text-fluid-pink transition-colors flex items-center gap-2">
+                        <i class="fa-solid fa-rocket text-xs text-fluid-cyan"></i> Запуск
+                    </a>
+                </nav>
+
+                <!-- Actions -->
+                <div class="hidden md:flex items-center gap-4">
+                    <a href="https://github.com/Kraits7/HIXOS" target="_blank" rel="noopener noreferrer" 
+                       class="flex items-center gap-2 px-4 py-2 rounded-2xl bg-slate-800/80 hover:bg-slate-700 text-white text-sm font-medium border border-slate-700/80 transition-all hover:shadow-lg hover:shadow-fluid-purple/20">
+                        <i class="fa-brands fa-github text-lg"></i>
+                        <span>GitHub</span>
+                    </a>
+                </div>
+
+                <!-- Mobile Menu Toggle -->
+                <button id="mobile-menu-btn" class="md:hidden p-2 rounded-xl text-slate-300 hover:text-white hover:bg-slate-800 focus:outline-none">
+                    <i class="fa-solid fa-bars text-xl" id="menu-icon"></i>
+                </button>
+            </div>
+        </div>
+
+        <!-- Mobile Navigation Menu -->
+        <div id="mobile-menu" class="hidden md:hidden border-b border-slate-800 bg-slate-950/95 px-4 pt-3 pb-5 space-y-3">
+            <a href="#simulator" class="block py-2 text-slate-200 hover:text-fluid-pink font-medium">Симулятор OS</a>
+            <a href="#animations" class="block py-2 text-slate-200 hover:text-fluid-pink font-medium">Fluid Анимации</a>
+            <a href="#tech" class="block py-2 text-slate-200 hover:text-fluid-pink font-medium">PyQt5 и Движок</a>
+            <a href="#quickstart" class="block py-2 text-slate-200 hover:text-fluid-pink font-medium">Быстрый запуск</a>
+            <a href="https://github.com/Kraits7/HIXOS" target="_blank" class="flex items-center justify-center gap-2 py-3 rounded-xl bg-gradient-to-r from-fluid-purple to-fluid-pink text-white font-semibold shadow-lg">
+                <i class="fa-brands fa-github text-lg"></i>
+                <span>Открыть GitHub</span>
+            </a>
+        </div>
+    </header>
+
+    <main class="relative z-10">
+
+        <!-- Hero Section -->
+        <section class="pt-16 pb-20 lg:pt-24 lg:pb-32 px-4 sm:px-6 lg:px-8 max-w-7xl mx-auto">
+            <div class="grid grid-cols-1 lg:grid-cols-12 gap-12 items-center">
+                
+                <!-- Hero Left Column: Heading & Info -->
+                <div class="lg:col-span-7 text-center lg:text-left">
+                    
+                    <div class="inline-flex items-center gap-2 px-3.5 py-1.5 rounded-full bg-slate-900/80 border border-slate-700/80 text-xs font-medium text-fluid-cyan mb-6 backdrop-blur-md">
+                        <span class="w-2 h-2 rounded-full bg-fluid-cyan animate-pulse"></span>
+                        Мобильная среда нового поколения на Python
+                    </div>
+
+                    <h1 class="text-4xl sm:text-6xl xl:text-7xl font-outfit font-extrabold tracking-tight text-white mb-6 leading-tight">
+                        Симулятор мобильной ОС с <br class="hidden sm:inline" />
+                        <span class="fluid-gradient-text">Fluid UI & Анимациями</span>
+                    </h1>
+
+                    <p class="text-base sm:text-xl text-slate-300 mb-8 leading-relaxed font-light max-w-2xl mx-auto lg:mx-0">
+                        <strong class="text-white font-semibold">HIXOS</strong> — это симулятор мобильной операционной системы (смартфона), построенный на мощности <span class="text-fluid-purple font-medium">Python (PyQt5)</span> и оптимизированный под <span class="text-fluid-cyan font-medium">Web</span>. Главная фишка системы — плавные физические анимации, супер-отклик и интерфейс в стиле Fluid Design.
+                    </p>
+
+                    <!-- Feature Badges -->
+                    <div class="flex flex-wrap justify-center lg:justify-start gap-3 mb-10">
+                        <span class="inline-flex items-center gap-2 px-3.5 py-1.5 rounded-xl bg-slate-900/60 border border-slate-800 text-xs font-medium text-slate-200">
+                            <i class="fa-solid fa-mobile-screen text-fluid-pink"></i> Phone Simulator
+                        </span>
+                        <span class="inline-flex items-center gap-2 px-3.5 py-1.5 rounded-xl bg-slate-900/60 border border-slate-800 text-xs font-medium text-slate-200">
+                            <i class="fa-solid fa-wand-magic-sparkles text-fluid-purple"></i> Fluid Animations
+                        </span>
+                        <span class="inline-flex items-center gap-2 px-3.5 py-1.5 rounded-xl bg-slate-900/60 border border-slate-800 text-xs font-medium text-slate-200">
+                            <i class="fa-brands fa-python text-amber-400"></i> PyQt5 & PyScript
+                        </span>
+                    </div>
+
+                    <!-- Hero Call to Action Buttons -->
+                    <div class="flex flex-col sm:flex-row items-center justify-center lg:justify-start gap-4">
+                        <a href="#simulator" 
+                           class="w-full sm:w-auto px-8 py-4 rounded-2xl bg-gradient-to-r from-fluid-purple via-fluid-pink to-fluid-cyan hover:opacity-95 text-white font-semibold text-base shadow-xl shadow-fluid-purple/25 transition-all transform hover:-translate-y-0.5 flex items-center justify-center gap-3">
+                            <i class="fa-solid fa-play text-lg"></i>
+                            <span>Запустить Симулятор</span>
+                        </a>
+
+                        <a href="https://github.com/Kraits7/HIXOS" target="_blank" 
+                           class="w-full sm:w-auto px-8 py-4 rounded-2xl bg-slate-900/80 hover:bg-slate-800 text-slate-200 font-semibold text-base border border-slate-800 transition-all flex items-center justify-center gap-3">
+                            <i class="fa-brands fa-github text-lg"></i>
+                            <span>Исходный Код</span>
+                        </a>
+                    </div>
+
+                </div>
+
+                <!-- Hero Right Column: Phone Graphic Teaser -->
+                <div class="lg:col-span-5 flex justify-center relative">
+                    <div class="relative w-full max-w-[320px] aspect-[9/19] rounded-[48px] p-3 glass-fluid border-2 border-white/20 shadow-2xl shadow-fluid-purple/30 animate-float">
+                        <!-- Phone Notch -->
+                        <div class="absolute top-5 left-1/2 -translate-x-1/2 w-28 h-4 bg-slate-950 rounded-full z-30 flex items-center justify-end px-3">
+                            <div class="w-2 h-2 rounded-full bg-slate-800"></div>
+                        </div>
+                        <!-- Phone Display -->
+                        <div class="w-full h-full rounded-[38px] overflow-hidden wp-fluid-1 relative flex flex-col justify-between p-5 text-white">
+                            <!-- Status Bar -->
+                            <div class="flex justify-between items-center text-xs pt-1 font-mono text-slate-200">
+                                <span>12:45</span>
+                                <div class="flex gap-2 items-center">
+                                    <i class="fa-solid fa-wifi text-[10px]"></i>
+                                    <i class="fa-solid fa-battery-three-quarters text-[10px]"></i>
+                                </div>
+                            </div>
+
+                            <!-- Floating Phone Center Widget -->
+                            <div class="glass-phone p-4 rounded-2xl border border-white/10 text-center my-auto">
+                                <img src="https://raw.githubusercontent.com/Kraits7/HIXOS/refs/heads/main/System/Icons/hixos_logo.png" 
+                                     alt="HIXOS" class="w-14 h-14 mx-auto mb-2 object-contain bg-white rounded-xl p-2 shadow-lg"
+                                     onerror="this.src='https://placehold.co/100x100/ffffff/a855f7?text=HIXOS'">
+                                <h3 class="font-outfit font-bold text-lg text-white">HIXOS Phone</h3>
+                                <p class="text-[11px] text-slate-300">Fluid Python Environment</p>
+                            </div>
+
+                            <!-- Bottom Mini Dock -->
+                            <div class="glass-phone p-2.5 rounded-2xl flex justify-around items-center border border-white/10">
+                                <div class="w-9 h-9 rounded-xl bg-fluid-purple/30 flex items-center justify-center text-xs"><i class="fa-solid fa-phone"></i></div>
+                                <div class="w-9 h-9 rounded-xl bg-fluid-pink/30 flex items-center justify-center text-xs"><i class="fa-solid fa-message"></i></div>
+                                <div class="w-9 h-9 rounded-xl bg-fluid-cyan/30 flex items-center justify-center text-xs"><i class="fa-solid fa-globe"></i></div>
+                                <div class="w-9 h-9 rounded-xl bg-amber-500/30 flex items-center justify-center text-xs"><i class="fa-solid fa-gear"></i></div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+            </div>
+        </section>
+
+        <!-- Interactive Mobile OS Simulator Section -->
+        <section id="simulator" class="py-20 px-4 sm:px-6 lg:px-8 max-w-7xl mx-auto border-t border-slate-800/60">
+            <div class="text-center mb-12">
+                <h2 class="text-xs font-bold uppercase tracking-widest text-fluid-pink mb-2">ИНТЕРАКТИВНЫЙ МАКЕТ</h2>
+                <p class="text-3xl sm:text-5xl font-outfit font-extrabold text-white">Онлайн Симулятор HIXOS</p>
+                <p class="text-slate-400 text-sm mt-3 max-w-xl mx-auto">
+                    Кликайте по иконкам, открывайте мобильные приложения HIXOS, управляйте шторкой и меняйте обои прямо на макете смартфона.
+                </p>
+            </div>
+
+            <!-- Phone Simulator Container -->
+            <div class="flex flex-col lg:flex-row items-center justify-center gap-12">
+                
+                <!-- Interactive Phone Device Frame -->
+                <div class="relative w-full max-w-[360px] aspect-[9/18.5] rounded-[50px] p-3.5 glass-fluid border-2 border-white/20 shadow-2xl shadow-fluid-purple/20">
+                    
+                    <!-- Top Speaker / Camera Notch -->
+                    <div class="absolute top-5 left-1/2 -translate-x-1/2 w-32 h-4 bg-slate-950 rounded-full z-40 flex items-center justify-between px-4">
+                        <div class="w-2.5 h-2.5 rounded-full bg-slate-800"></div>
+                        <div class="w-2.5 h-2.5 rounded-full bg-blue-900/60"></div>
+                    </div>
+
+                    <!-- Phone Screen Window -->
+                    <div id="phone-screen" class="w-full h-full rounded-[40px] overflow-hidden wp-fluid-1 relative flex flex-col justify-between p-4 text-white transition-all duration-700">
+                        
+                        <!-- Top Status Bar (Pull down for control center) -->
+                        <div id="phone-status-bar" class="flex justify-between items-center text-xs font-mono text-slate-200 z-30 cursor-pointer pt-1" onclick="toggleControlCenter()">
+                            <span id="phone-clock">12:00</span>
+                            <div class="flex items-center gap-2">
+                                <i class="fa-solid fa-wifi text-[11px]"></i>
+                                <i class="fa-solid fa-signal text-[11px]"></i>
+                                <i class="fa-solid fa-battery-full text-[11px]"></i>
+                            </div>
+                        </div>
+
+                        <!-- Main Screen Content Container -->
+                        <div id="phone-screen-content" class="relative flex-1 flex flex-col justify-between py-6">
+                            
+                            <!-- Widget Clock & Date -->
+                            <div class="text-center space-y-1 my-2">
+                                <div id="widget-time" class="text-4xl font-outfit font-extrabold tracking-tight">12:00</div>
+                                <div id="widget-date" class="text-xs font-medium text-slate-300/80">Понедельник, 12 Октября</div>
+                            </div>
+
+                            <!-- Apps Grid (4x3) -->
+                            <div class="grid grid-cols-4 gap-3 my-auto">
+                                
+                                <!-- App 1: Gallery -->
+                                <button onclick="openPhoneApp('Галерея', 'fa-images', 'bg-rose-500')" class="phone-app-card flex flex-col items-center gap-1.5 focus:outline-none">
+                                    <div class="w-12 h-12 rounded-2xl bg-gradient-to-tr from-rose-500 to-pink-400 flex items-center justify-center text-xl shadow-lg shadow-rose-500/30">
+                                        <i class="fa-solid fa-images"></i>
+                                    </div>
+                                    <span class="text-[10px] font-medium text-slate-200">Галерея</span>
+                                </button>
+
+                                <!-- App 2: Settings -->
+                                <button onclick="openPhoneApp('Настройки', 'fa-gear', 'bg-slate-700')" class="phone-app-card flex flex-col items-center gap-1.5 focus:outline-none">
+                                    <div class="w-12 h-12 rounded-2xl bg-gradient-to-tr from-slate-700 to-slate-500 flex items-center justify-center text-xl shadow-lg shadow-slate-700/30">
+                                        <i class="fa-solid fa-gear"></i>
+                                    </div>
+                                    <span class="text-[10px] font-medium text-slate-200">Настройки</span>
+                                </button>
+
+                                <!-- App 3: Terminal -->
+                                <button onclick="openPhoneApp('Терминал', 'fa-terminal', 'bg-emerald-600')" class="phone-app-card flex flex-col items-center gap-1.5 focus:outline-none">
+                                    <div class="w-12 h-12 rounded-2xl bg-gradient-to-tr from-emerald-600 to-teal-400 flex items-center justify-center text-xl shadow-lg shadow-emerald-600/30">
+                                        <i class="fa-solid fa-terminal"></i>
+                                    </div>
+                                    <span class="text-[10px] font-medium text-slate-200">Терминал</span>
+                                </button>
+
+                                <!-- App 4: Calculator -->
+                                <button onclick="openPhoneApp('Калькулятор', 'fa-calculator', 'bg-amber-500')" class="phone-app-card flex flex-col items-center gap-1.5 focus:outline-none">
+                                    <div class="w-12 h-12 rounded-2xl bg-gradient-to-tr from-amber-500 to-orange-400 flex items-center justify-center text-xl shadow-lg shadow-amber-500/30">
+                                        <i class="fa-solid fa-calculator"></i>
+                                    </div>
+                                    <span class="text-[10px] font-medium text-slate-200">Счётчик</span>
+                                </button>
+
+                                <!-- App 5: Music Player -->
+                                <button onclick="openPhoneApp('Музыка', 'fa-music', 'bg-purple-600')" class="phone-app-card flex flex-col items-center gap-1.5 focus:outline-none">
+                                    <div class="w-12 h-12 rounded-2xl bg-gradient-to-tr from-purple-600 to-fluid-pink flex items-center justify-center text-xl shadow-lg shadow-purple-600/30">
+                                        <i class="fa-solid fa-music"></i>
+                                    </div>
+                                    <span class="text-[10px] font-medium text-slate-200">Плеер</span>
+                                </button>
+
+                                <!-- App 6: HIXOS Info -->
+                                <button onclick="openPhoneApp('О HIXOS', 'fa-info-circle', 'bg-fluid-cyan')" class="phone-app-card flex flex-col items-center gap-1.5 focus:outline-none">
+                                    <div class="w-12 h-12 rounded-2xl bg-gradient-to-tr from-fluid-cyan to-blue-500 flex items-center justify-center text-xl shadow-lg shadow-fluid-cyan/30">
+                                        <i class="fa-solid fa-circle-info"></i>
+                                    </div>
+                                    <span class="text-[10px] font-medium text-slate-200">О системе</span>
+                                </button>
+
+                                <!-- App 7: Animations -->
+                                <button onclick="openPhoneApp('Fluid Демо', 'fa-wand-magic-sparkles', 'bg-indigo-600')" class="phone-app-card flex flex-col items-center gap-1.5 focus:outline-none">
+                                    <div class="w-12 h-12 rounded-2xl bg-gradient-to-tr from-indigo-600 to-purple-500 flex items-center justify-center text-xl shadow-lg shadow-indigo-600/30">
+                                        <i class="fa-solid fa-wand-magic-sparkles"></i>
+                                    </div>
+                                    <span class="text-[10px] font-medium text-slate-200">Анимация</span>
+                                </button>
+
+                                <!-- App 8: Files -->
+                                <button onclick="openPhoneApp('Файлы', 'fa-folder-open', 'bg-blue-600')" class="phone-app-card flex flex-col items-center gap-1.5 focus:outline-none">
+                                    <div class="w-12 h-12 rounded-2xl bg-gradient-to-tr from-blue-600 to-sky-400 flex items-center justify-center text-xl shadow-lg shadow-blue-600/30">
+                                        <i class="fa-solid fa-folder"></i>
+                                    </div>
+                                    <span class="text-[10px] font-medium text-slate-200">Файлы</span>
+                                </button>
+
+                            </div>
+
+                            <!-- Bottom Floating Dock Bar -->
+                            <div class="glass-phone p-2.5 rounded-3xl flex justify-around items-center border border-white/20 mt-auto">
+                                <button onclick="openPhoneApp('Телефон', 'fa-phone', 'bg-emerald-500')" class="w-11 h-11 rounded-2xl bg-emerald-500 flex items-center justify-center text-lg hover:scale-110 transition-transform"><i class="fa-solid fa-phone"></i></button>
+                                <button onclick="openPhoneApp('Сообщения', 'fa-comment', 'bg-blue-500')" class="w-11 h-11 rounded-2xl bg-blue-500 flex items-center justify-center text-lg hover:scale-110 transition-transform"><i class="fa-solid fa-comment"></i></button>
+                                <button onclick="openPhoneApp('Браузер', 'fa-compass', 'bg-fluid-pink')" class="w-11 h-11 rounded-2xl bg-fluid-pink flex items-center justify-center text-lg hover:scale-110 transition-transform"><i class="fa-solid fa-compass"></i></button>
+                                <button onclick="openPhoneApp('Камера', 'fa-camera', 'bg-slate-700')" class="w-11 h-11 rounded-2xl bg-slate-700 flex items-center justify-center text-lg hover:scale-110 transition-transform"><i class="fa-solid fa-camera"></i></button>
+                            </div>
+
+                        </div>
+
+                        <!-- Active App Window Overlay (App Launcher Animation Target) -->
+                        <div id="phone-app-window" class="absolute inset-0 z-20 bg-slate-900/95 backdrop-blur-xl translate-y-full spring-transition rounded-[40px] p-5 flex flex-col justify-between">
+                            <div class="flex items-center justify-between border-b border-slate-800 pb-3 mt-4">
+                                <div class="flex items-center gap-2">
+                                    <div id="app-window-icon" class="w-7 h-7 rounded-lg bg-fluid-purple flex items-center justify-center text-xs">
+                                        <i class="fa-solid fa-cube"></i>
+                                    </div>
+                                    <span id="app-window-title" class="font-outfit font-bold text-sm text-white">Приложение</span>
+                                </div>
+                                <button onclick="closePhoneApp()" class="w-7 h-7 rounded-full bg-slate-800 text-slate-300 flex items-center justify-center text-xs hover:bg-slate-700">
+                                    <i class="fa-solid fa-xmark"></i>
+                                </button>
+                            </div>
+
+                            <!-- App Screen Body -->
+                            <div id="app-window-content" class="flex-1 my-4 flex flex-col justify-center items-center text-center p-4">
+                                <!-- Dynamic App Content Scripted in JS -->
+                            </div>
+
+                            <!-- Phone Bottom Home Gesture Bar -->
+                            <button onclick="closePhoneApp()" class="w-28 h-1 bg-slate-400/60 rounded-full mx-auto my-1 hover:bg-white transition-colors cursor-pointer focus:outline-none"></button>
+                        </div>
+
+                        <!-- Control Center Overlay -->
+                        <div id="control-center" class="absolute inset-0 z-40 bg-slate-950/90 backdrop-blur-2xl -translate-y-full spring-transition rounded-[40px] p-5 flex flex-col justify-between">
+                            <div class="mt-4 space-y-4">
+                                <div class="flex justify-between items-center">
+                                    <span class="font-outfit font-bold text-sm text-white">Центр Управления HIXOS</span>
+                                    <button onclick="toggleControlCenter()" class="text-xs text-slate-400 hover:text-white"><i class="fa-solid fa-chevron-up"></i></button>
+                                </div>
+
+                                <!-- Quick Toggles -->
+                                <div class="grid grid-cols-2 gap-3">
+                                    <div class="glass-phone p-3 rounded-2xl flex items-center gap-3">
+                                        <i class="fa-solid fa-wifi text-fluid-cyan text-lg"></i>
+                                        <div>
+                                            <div class="text-xs font-bold text-white">Wi-Fi</div>
+                                            <div class="text-[10px] text-slate-400">Подключено</div>
+                                        </div>
+                                    </div>
+                                    <div class="glass-phone p-3 rounded-2xl flex items-center gap-3">
+                                        <i class="fa-brands fa-bluetooth-b text-fluid-purple text-lg"></i>
+                                        <div>
+                                            <div class="text-xs font-bold text-white">Bluetooth</div>
+                                            <div class="text-[10px] text-slate-400">Активен</div>
+                                        </div>
+                                    </div>
+                                </div>
+
+                                <!-- Brightness / Volume Sliders -->
+                                <div class="space-y-3">
+                                    <div class="glass-phone p-3 rounded-2xl flex items-center gap-3">
+                                        <i class="fa-solid fa-sun text-amber-400 text-sm"></i>
+                                        <input type="range" class="w-full accent-fluid-pink h-1 bg-slate-800 rounded-lg cursor-pointer" value="80">
+                                    </div>
+                                    <div class="glass-phone p-3 rounded-2xl flex items-center gap-3">
+                                        <i class="fa-solid fa-volume-high text-fluid-purple text-sm"></i>
+                                        <input type="range" class="w-full accent-fluid-purple h-1 bg-slate-800 rounded-lg cursor-pointer" value="65">
+                                    </div>
+                                </div>
+                            </div>
+
+                            <button onclick="toggleControlCenter()" class="w-28 h-1 bg-slate-400/60 rounded-full mx-auto my-1 cursor-pointer"></button>
+                        </div>
+
+                    </div>
+                </div>
+
+                <!-- Simulator Controls & Info Column -->
+                <div class="flex-1 max-w-lg space-y-6">
+                    
+                    <div class="glass-fluid p-6 rounded-3xl border border-slate-800">
+                        <h3 class="font-outfit font-bold text-xl text-white mb-2 flex items-center gap-2">
+                            <i class="fa-solid fa-palette text-fluid-pink"></i> Смена Обоев HIXOS
+                        </h3>
+                        <p class="text-xs text-slate-300 mb-4">Выберите тему графического пространства симулятора:</p>
+                        <div class="flex gap-3">
+                            <button onclick="setWallpaper('wp-fluid-1')" class="w-12 h-12 rounded-2xl wp-fluid-1 ring-2 ring-white/30 hover:scale-105 transition-transform"></button>
+                            <button onclick="setWallpaper('wp-fluid-2')" class="w-12 h-12 rounded-2xl wp-fluid-2 ring-2 ring-white/30 hover:scale-105 transition-transform"></button>
+                            <button onclick="setWallpaper('wp-fluid-3')" class="w-12 h-12 rounded-2xl wp-fluid-3 ring-2 ring-white/30 hover:scale-105 transition-transform"></button>
+                        </div>
+                    </div>
+
+                    <div class="glass-fluid p-6 rounded-3xl border border-slate-800 space-y-4">
+                        <h3 class="font-outfit font-bold text-xl text-white flex items-center gap-2">
+                            <i class="fa-solid fa-sliders text-fluid-cyan"></i> Жесты и Взаимодействие
+                        </h3>
+                        <ul class="text-xs text-slate-300 space-y-2.5">
+                            <li class="flex items-center gap-2">
+                                <span class="w-5 h-5 rounded-full bg-fluid-purple/20 text-fluid-purple flex items-center justify-center text-[10px]"><i class="fa-solid fa-hand-pointer"></i></span>
+                                Нажмите на любую иконку для запуска встроенных микро-приложений.
+                            </li>
+                            <li class="flex items-center gap-2">
+                                <span class="w-5 h-5 rounded-full bg-fluid-pink/20 text-fluid-pink flex items-center justify-center text-[10px]"><i class="fa-solid fa-arrows-up-down"></i></span>
+                                Нажмите на верхний статус-бар для вызова Центра Управления.
+                            </li>
+                            <li class="flex items-center gap-2">
+                                <span class="w-5 h-5 rounded-full bg-fluid-cyan/20 text-fluid-cyan flex items-center justify-center text-[10px]"><i class="fa-solid fa-minus"></i></span>
+                                Нажмите на нижнюю полоску-жест (Home bar) для сворачивания приложения.
+                            </li>
+                        </ul>
+                    </div>
+
+                </div>
+
+            </div>
+        </section>
+
+        <!-- Fluid Animation Showcase Section -->
+        <section id="animations" class="py-20 px-4 sm:px-6 lg:px-8 max-w-7xl mx-auto border-t border-slate-800/60">
+            <div class="text-center mb-16">
+                <h2 class="text-xs font-bold uppercase tracking-widest text-fluid-purple mb-2">ГЛАВНАЯ ФИШКА HIXOS</h2>
+                <p class="text-3xl sm:text-5xl font-outfit font-extrabold text-white">Плавность и Физика Движения</p>
+                <p class="text-slate-400 text-sm mt-3 max-w-2xl mx-auto">
+                    Каждый элемент HIXOS анимирован с использованием физики пружины (Spring Curves) и размытия в реальном времени.
+                </p>
+            </div>
+
+            <!-- Playground Controls & Interactive Fluid Object -->
+            <div class="glass-fluid p-8 rounded-3xl border border-slate-800 max-w-4xl mx-auto grid grid-cols-1 md:grid-cols-2 gap-8 items-center">
+                
+                <!-- Animation Tuning Controls -->
+                <div class="space-y-6">
+                    <h3 class="font-outfit font-bold text-lg text-white">Интерактивный Тюнер Физики</h3>
+                    
+                    <!-- Control 1: Spring Stiffness -->
+                    <div>
+                        <div class="flex justify-between text-xs text-slate-300 mb-1">
+                            <span>Жесткость пружины (Stiffness)</span>
+                            <span id="stiffness-val" class="font-mono text-fluid-purple">0.5s</span>
+                        </div>
+                        <input type="range" min="0.1" max="1.5" step="0.1" value="0.5" id="spring-speed" 
+                               class="w-full accent-fluid-purple h-1.5 bg-slate-800 rounded-lg cursor-pointer"
+                               oninput="updatePhysicsDemo()">
+                    </div>
+
+                    <!-- Control 2: Scale Factor -->
+                    <div>
+                        <div class="flex justify-between text-xs text-slate-300 mb-1">
+                            <span>Масштабирование (Scale)</span>
+                            <span id="scale-val" class="font-mono text-fluid-pink">1.25x</span>
+                        </div>
+                        <input type="range" min="1.0" max="1.8" step="0.05" value="1.25" id="scale-factor" 
+                               class="w-full accent-fluid-pink h-1.5 bg-slate-800 rounded-lg cursor-pointer"
+                               oninput="updatePhysicsDemo()">
+                    </div>
+
+                    <!-- Control 3: Blur intensity -->
+                    <div>
+                        <div class="flex justify-between text-xs text-slate-300 mb-1">
+                            <span>Интенсивность размытия (Blur)</span>
+                            <span id="blur-val" class="font-mono text-fluid-cyan">20px</span>
+                        </div>
+                        <input type="range" min="0" max="40" step="2" value="20" id="blur-amount" 
+                               class="w-full accent-fluid-cyan h-1.5 bg-slate-800 rounded-lg cursor-pointer"
+                               oninput="updatePhysicsDemo()">
+                    </div>
+                </div>
+
+                <!-- Interactive Fluid Physics Object Box -->
+                <div class="flex flex-col items-center justify-center p-8 bg-slate-950/80 rounded-2xl border border-slate-800 relative min-h-[220px]">
+                    <div id="demo-fluid-box" 
+                         onclick="triggerDemoAnimation()"
+                         class="w-24 h-24 rounded-3xl bg-gradient-to-tr from-fluid-purple via-fluid-pink to-fluid-cyan flex items-center justify-center text-white text-2xl shadow-xl shadow-fluid-purple/30 cursor-pointer spring-transition select-none">
+                        <i class="fa-solid fa-touch-app"></i>
+                    </div>
+                    <span class="text-[11px] text-slate-400 mt-4">Нажмите на карточку для проверки физики</span>
+                </div>
+
+            </div>
+        </section>
+
+        <!-- Tech Engine Stack (PyQt5 & Web) -->
+        <section id="tech" class="py-20 px-4 sm:px-6 lg:px-8 max-w-7xl mx-auto border-t border-slate-800/60">
+            <div class="text-center mb-16">
+                <h2 class="text-xs font-bold uppercase tracking-widest text-fluid-cyan mb-2">АРХИТЕКТУРА И ДВИЖОК</h2>
+                <p class="text-3xl sm:text-5xl font-outfit font-extrabold text-white">Две Версии — Одна ДНК</p>
+                <p class="text-slate-400 text-sm mt-3">HIXOS функционирует как нативное десктопное приложение и в веб-среде</p>
+            </div>
+
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-8">
+                
+                <!-- PyQt5 Desktop Edition -->
+                <div class="glass-fluid p-8 rounded-3xl border border-slate-800 hover:border-fluid-purple/50 transition-all group">
+                    <div class="w-14 h-14 rounded-2xl bg-amber-500/10 text-amber-400 flex items-center justify-center text-3xl mb-6 group-hover:scale-110 transition-transform">
+                        <i class="fa-brands fa-python"></i>
+                    </div>
+                    <h3 class="font-outfit font-bold text-2xl text-white mb-3">PyQt5 Native Edition</h3>
+                    <p class="text-slate-300 text-sm leading-relaxed mb-6">
+                        Полноценный симулятор телефона, исполняемый на Python с использованием графической библиотеки PyQt5. Высокая производительность, аппаратное ускорение и поддержка локальных файловых систем.
+                    </p>
+                    <ul class="text-xs text-slate-400 space-y-2 border-t border-slate-800/80 pt-4">
+                        <li class="flex items-center gap-2"><i class="fa-solid fa-check text-emerald-400"></i> Прямой доступ к системе через Python</li>
+                        <li class="flex items-center gap-2"><i class="fa-solid fa-check text-emerald-400"></i> Нативный Qt 5 интерфейс с кастомными стилями QSS</li>
+                        <li class="flex items-center gap-2"><i class="fa-solid fa-check text-emerald-400"></i> Плавная отрисовка окон приложения</li>
+                    </ul>
+                </div>
+
+                <!-- Web / PyScript Edition -->
+                <div class="glass-fluid p-8 rounded-3xl border border-slate-800 hover:border-fluid-cyan/50 transition-all group">
+                    <div class="w-14 h-14 rounded-2xl bg-fluid-cyan/10 text-fluid-cyan flex items-center justify-center text-3xl mb-6 group-hover:scale-110 transition-transform">
+                        <i class="fa-solid fa-globe"></i>
+                    </div>
+                    <h3 class="font-outfit font-bold text-2xl text-white mb-3">Web & Mobile Edition</h3>
+                    <p class="text-slate-300 text-sm leading-relaxed mb-6">
+                        Веб-интерпретация симулятора HIXOS для запуска непосредственно в браузере или на мобильных устройствах без необходимости установки стороннего окружения.
+                    </p>
+                    <ul class="text-xs text-slate-400 space-y-2 border-t border-slate-800/80 pt-4">
+                        <li class="flex items-center gap-2"><i class="fa-solid fa-check text-emerald-400"></i> Мгновенный запуск в любом современном браузере</li>
+                        <li class="flex items-center gap-2"><i class="fa-solid fa-check text-emerald-400"></i> Поддержка тач-жестов на смартфонах</li>
+                        <li class="flex items-center gap-2"><i class="fa-solid fa-check text-emerald-400"></i> Адаптивный рендеринг компонентов</li>
+                    </ul>
+                </div>
+
+            </div>
+        </section>
+
+        <!-- Quick Start / Installation Section -->
+        <section id="quickstart" class="py-20 px-4 sm:px-6 lg:px-8 max-w-5xl mx-auto border-t border-slate-800/60">
+            <div class="text-center mb-12">
+                <h2 class="text-xs font-bold uppercase tracking-widest text-fluid-pink mb-2">УСТАНОВКА И ЗАПУСК</h2>
+                <p class="text-3xl sm:text-5xl font-outfit font-extrabold text-white">Быстрый Старт</p>
+                <p class="text-slate-400 text-sm mt-2">Запустите HIXOS на своём ПК с помощью Python и PyQt5</p>
+            </div>
+
+            <!-- Terminal Installation Command Cards -->
+            <div class="space-y-6">
+                
+                <!-- Command 1 -->
+                <div class="glass-fluid p-6 rounded-2xl border border-slate-800">
+                    <div class="flex items-center justify-between mb-3">
+                        <span class="text-xs font-mono font-semibold text-fluid-purple">1. Клонирование HIXOS</span>
+                        <button onclick="copyToClipboard('git clone https://github.com/Kraits7/HIXOS.git', this)" 
+                                class="text-xs text-slate-400 hover:text-white bg-slate-800/80 px-3 py-1.5 rounded-xl border border-slate-700 flex items-center gap-1.5 transition">
+                            <i class="fa-regular fa-copy"></i>
+                            <span>Копировать</span>
+                        </button>
+                    </div>
+                    <pre class="bg-slate-950 p-4 rounded-xl font-mono text-sm text-emerald-400 overflow-x-auto border border-slate-900">git clone https://github.com/Kraits7/HIXOS.git
+cd HIXOS</pre>
+                </div>
+
+                <!-- Command 2 -->
+                <div class="glass-fluid p-6 rounded-2xl border border-slate-800">
+                    <div class="flex items-center justify-between mb-3">
+                        <span class="text-xs font-mono font-semibold text-fluid-pink">2. Установка зависимостей PyQt5</span>
+                        <button onclick="copyToClipboard('pip install PyQt5', this)" 
+                                class="text-xs text-slate-400 hover:text-white bg-slate-800/80 px-3 py-1.5 rounded-xl border border-slate-700 flex items-center gap-1.5 transition">
+                            <i class="fa-regular fa-copy"></i>
+                            <span>Копировать</span>
+                        </button>
+                    </div>
+                    <pre class="bg-slate-950 p-4 rounded-xl font-mono text-sm text-emerald-400 overflow-x-auto border border-slate-900">pip install PyQt5</pre>
+                </div>
+
+                <!-- Command 3 -->
+                <div class="glass-fluid p-6 rounded-2xl border border-slate-800">
+                    <div class="flex items-center justify-between mb-3">
+                        <span class="text-xs font-mono font-semibold text-fluid-cyan">3. Запуск симулятора</span>
+                        <button onclick="copyToClipboard('python main.py', this)" 
+                                class="text-xs text-slate-400 hover:text-white bg-slate-800/80 px-3 py-1.5 rounded-xl border border-slate-700 flex items-center gap-1.5 transition">
+                            <i class="fa-regular fa-copy"></i>
+                            <span>Копировать</span>
+                        </button>
+                    </div>
+                    <pre class="bg-slate-950 p-4 rounded-xl font-mono text-sm text-emerald-400 overflow-x-auto border border-slate-900">python main.py</pre>
+                </div>
+
+            </div>
+        </section>
+
+    </main>
+
+    <!-- Footer -->
+    <footer class="border-t border-slate-800/80 bg-slate-950/90 py-12 px-4 sm:px-6 lg:px-8 text-slate-400 text-sm">
+        <div class="max-w-7xl mx-auto flex flex-col md:flex-row items-center justify-between gap-6">
+            
+            <div class="flex items-center gap-3">
+                <div class="w-8 h-8 rounded-xl bg-white p-1 flex items-center justify-center">
+                    <img src="https://raw.githubusercontent.com/Kraits7/HIXOS/refs/heads/main/System/Icons/hixos_logo.png" 
+                         alt="HIXOS" class="max-w-full max-h-full object-contain"
+                         onerror="this.src='https://placehold.co/80x80/ffffff/a855f7?text=HIXOS'">
+                </div>
+                <span class="font-outfit font-bold text-white text-base">HIXOS Project</span>
+            </div>
+
+            <div class="flex items-center gap-6 text-xs text-slate-400">
+                <a href="#simulator" class="hover:text-white transition">Симулятор</a>
+                <a href="#animations" class="hover:text-white transition">Fluid Анимация</a>
+                <a href="#tech" class="hover:text-white transition">PyQt5 Движок</a>
+                <a href="https://github.com/Kraits7/HIXOS" target="_blank" class="hover:text-white transition">GitHub</a>
+            </div>
+
+            <div class="text-xs text-slate-500 text-center md:text-right">
+                © <span id="year"></span> HIXOS. Python & PyQt5 Phone Simulator Engine.
+            </div>
+
+        </div>
+    </footer>
+
+    <!-- Notification Toast -->
+    <div id="toast" class="fixed bottom-5 right-5 bg-gradient-to-r from-fluid-purple to-fluid-pink text-white px-5 py-3 rounded-2xl shadow-2xl opacity-0 transition-opacity duration-300 pointer-events-none flex items-center gap-2 text-sm z-50">
+        <i class="fa-solid fa-circle-check"></i>
+        <span id="toast-message">Команда скопирована!</span>
+    </div>
+
+    <!-- JavaScript Interactions Engine -->
+    <script>
+        document.getElementById('year').textContent = new Date().getFullYear();
+
+        // Mobile Menu Toggle
+        const mobileBtn = document.getElementById('mobile-menu-btn');
+        const mobileMenu = document.getElementById('mobile-menu');
+        const menuIcon = document.getElementById('menu-icon');
+
+        mobileBtn.addEventListener('click', () => {
+            mobileMenu.classList.toggle('hidden');
+            if(mobileMenu.classList.contains('hidden')) {
+                menuIcon.className = 'fa-solid fa-bars text-xl';
+            } else {
+                menuIcon.className = 'fa-solid fa-xmark text-xl';
+            }
+        });
+
+        // Copy Helper
+        function copyToClipboard(text, btnElement) {
+            const textarea = document.createElement('textarea');
+            textarea.value = text;
+            document.body.appendChild(textarea);
+            textarea.select();
+            document.execCommand('copy');
+            document.body.removeChild(textarea);
+
+            showToast('Скопировано в буфер!');
+        }
+
+        function showToast(msg) {
+            const toast = document.getElementById('toast');
+            const toastMsg = document.getElementById('toast-message');
+            toastMsg.textContent = msg;
+            toast.classList.remove('opacity-0');
+            toast.classList.add('opacity-100');
+            setTimeout(() => {
+                toast.classList.remove('opacity-100');
+                toast.classList.add('opacity-0');
+            }, 2500);
+        }
+
+        // --- Interactive Phone Simulator Script ---
+        function updatePhoneClock() {
+            const now = new Date();
+            const hours = String(now.getHours()).padStart(2, '0');
+            const minutes = String(now.getMinutes()).padStart(2, '0');
+            
+            const timeStr = `${hours}:${minutes}`;
+            
+            const clockEl = document.getElementById('phone-clock');
+            const widgetTimeEl = document.getElementById('widget-time');
+            if(clockEl) clockEl.textContent = timeStr;
+            if(widgetTimeEl) widgetTimeEl.textContent = timeStr;
+        }
+        setInterval(updatePhoneClock, 1000);
+        updatePhoneClock();
+
+        // Phone Wallpaper Switcher
+        function setWallpaper(classWP) {
+            const screen = document.getElementById('phone-screen');
+            screen.className = `w-full h-full rounded-[40px] overflow-hidden ${classWP} relative flex flex-col justify-between p-4 text-white transition-all duration-700`;
+            showToast('Обои обновлены!');
+        }
+
+        // Open Simulated Mobile App inside Phone Frame
+        function openPhoneApp(appName, iconClass, bgClass) {
+            const appWindow = document.getElementById('phone-app-window');
+            const appTitle = document.getElementById('app-window-title');
+            const appIcon = document.getElementById('app-window-icon');
+            const appBody = document.getElementById('app-window-content');
+
+            appTitle.textContent = appName;
+            appIcon.className = `w-7 h-7 rounded-lg ${bgClass} flex items-center justify-center text-xs text-white`;
+            appIcon.innerHTML = `<i class="fa-solid ${iconClass}"></i>`;
+
+            // Dynamic Mock App Views
+            if(appName === 'Терминал') {
+                appBody.innerHTML = `
+                    <div class="w-full h-full bg-slate-950 p-3 rounded-xl font-mono text-[10px] text-emerald-400 text-left overflow-y-auto space-y-1 border border-slate-800">
+                        <div>HIXOS PyEngine v1.0</div>
+                        <div>Python 3.11 / PyQt5 Module</div>
+                        <div class="text-slate-500">----------------------</div>
+                        <div>> hixos.init_ui()</div>
+                        <div>> fluid_render: OK</div>
+                        <div class="animate-pulse text-fluid-cyan">> готов к работе...</div>
+                    </div>`;
+            } else if(appName === 'Счётчик') {
+                appBody.innerHTML = `
+                    <div class="space-y-4">
+                        <div id="calc-val" class="text-3xl font-outfit font-bold text-white">0</div>
+                        <div class="grid grid-cols-2 gap-2">
+                            <button onclick="document.getElementById('calc-val').textContent = parseInt(document.getElementById('calc-val').textContent) + 1" class="px-4 py-2 bg-fluid-purple rounded-xl font-bold">+1</button>
+                            <button onclick="document.getElementById('calc-val').textContent = '0'" class="px-4 py-2 bg-slate-800 rounded-xl">Сброс</button>
+                        </div>
+                    </div>`;
+            } else if(appName === 'Галерея') {
+                appBody.innerHTML = `
+                    <div class="grid grid-cols-2 gap-2 w-full">
+                        <div class="aspect-square rounded-xl bg-gradient-to-tr from-purple-500 to-pink-500 flex items-center justify-center text-xs font-bold">Fluid 1</div>
+                        <div class="aspect-square rounded-xl bg-gradient-to-tr from-cyan-500 to-blue-500 flex items-center justify-center text-xs font-bold">Fluid 2</div>
+                    </div>`;
+            } else {
+                appBody.innerHTML = `
+                    <div class="space-y-2">
+                        <div class="w-12 h-12 rounded-2xl ${bgClass} flex items-center justify-center text-xl mx-auto text-white shadow-lg">
+                            <i class="fa-solid ${iconClass}"></i>
+                        </div>
+                        <h4 class="font-outfit font-bold text-white text-sm">${appName}</h4>
+                        <p class="text-[11px] text-slate-400">Микро-приложение работает в графическом пространстве HIXOS.</p>
+                    </div>`;
+            }
+
+            // Trigger Spring Open Animation
+            appWindow.classList.remove('translate-y-full');
+            appWindow.classList.add('translate-y-0');
+        }
+
+        // Close Simulated Phone App
+        function closePhoneApp() {
+            const appWindow = document.getElementById('phone-app-window');
+            appWindow.classList.remove('translate-y-0');
+            appWindow.classList.add('translate-y-full');
+        }
+
+        // Toggle Control Center
+        function toggleControlCenter() {
+            const cc = document.getElementById('control-center');
+            if(cc.classList.contains('-translate-y-full')) {
+                cc.classList.remove('-translate-y-full');
+                cc.classList.add('translate-y-0');
+            } else {
+                cc.classList.remove('translate-y-0');
+                cc.classList.add('-translate-y-full');
+            }
+        }
+
+        // --- Interactive Animation Tuner Demo ---
+        function updatePhysicsDemo() {
+            const speed = document.getElementById('spring-speed').value;
+            const scale = document.getElementById('scale-factor').value;
+            const blur = document.getElementById('blur-amount').value;
+
+            document.getElementById('stiffness-val').textContent = speed + 's';
+            document.getElementById('scale-val').textContent = scale + 'x';
+            document.getElementById('blur-val').textContent = blur + 'px';
+
+            const box = document.getElementById('demo-fluid-box');
+            box.style.transition = `all ${speed}s cubic-bezier(0.34, 1.56, 0.64, 1)`;
+            box.style.backdropFilter = `blur(${blur}px)`;
+        }
+
+        function triggerDemoAnimation() {
+            const box = document.getElementById('demo-fluid-box');
+            const scale = document.getElementById('scale-factor').value;
+            
+            box.style.transform = `scale(${scale}) rotate(6deg)`;
+            setTimeout(() => {
+                box.style.transform = 'scale(1) rotate(0deg)';
+            }, 300);
+        }
+    </script>
+</body>
+</html>

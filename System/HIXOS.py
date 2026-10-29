@@ -958,6 +958,7 @@ class MainWindow(QMainWindow):
         start_icon_rect = QRect(root.mapFromGlobal(g_tl), icon.rect().size())
 
         morph = MorphOverlay(root, start_icon_rect, start_rect,
+                             pixmap=icon._original_pixmap,      # финальный cross-dissolve в настоящую иконку
                              snapshot=shot, corner_start=22, corner_end=0,
                              rects_local=True)
         morph.set_progress(1.0)  # старт с полного экрана
@@ -972,9 +973,8 @@ class MainWindow(QMainWindow):
             # приложение свёрнуто — обновляем его живой снимок в недавних
             self._record_session(app_page)
 
-        # run_close идёт от прогресса 1->0, но у нас семантика та же:
-        # экран -> иконка. Углы: 0 (экран) -> 22 (иконка) уже в параметрах.
-        morph.run_close(duration=Duration.DISMISS, curve=Easing.STANDARD, on_finished=done)
+        # Точная iOS-кривая home-swipe: быстрый отрыв + долгое мягкое торможение к слоту
+        morph.run_close(duration=Duration.DISMISS, curve=Easing.IOS_DISMISS, on_finished=done)
 
 
     def show_app_page(self, app_id: str, icon_rect: QRect): 

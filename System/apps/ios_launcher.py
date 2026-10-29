@@ -511,9 +511,13 @@ class PageSwiper(QObject):
     RUBBER = 0.35          # rubber-band на краях, как в UIScrollView
     THRESHOLD_FRAC = 0.28  # доля ширины для смены страницы по скорости/смещению
 
-    def __init__(self, stack: QStackedLayout, owner):  # owner: IOSLauncherContent
-        super().__init__(stack)
-        self.stack = stack
+    def __init__(self, host: QWidget, owner):  # owner: IOSLauncherContent
+        super().__init__(host)
+        # ВАЖНО: ширина берётся у хоста (QWidget), а не у QStackedLayout —
+        # у QLayout нет метода width(); из-за self.stack.width() отпускание
+        # свайпа падало с AttributeError и приложения (в т.ч. в доке) не
+        # открывались, а страницы «залипали» со смещением друг над другом.
+        self.host = host
         self.owner = owner
         self._dragging = False
         self._moved = False
@@ -528,8 +532,13 @@ class PageSwiper(QObject):
     def dragging(self):
         return self._dragging
 
+    @property
+    def stack(self):
+        return self.host.layout()
+
     def _page_widgets(self):
-        return [self.stack.widget(i) for i in range(self.stack.count())]
+        st = self.stack
+        return [st.widget(i) for i in range(st.count())]
 
     def handle_press(self, pos: QPoint):
         if self.owner.overlay_active:
@@ -569,7 +578,7 @@ class PageSwiper(QObject):
         if not self._dragging:
             return
         self._dragging = False
-        w = max(1, self.stack.width())
+        w = max(1, self.host.width())
         idx = self.stack.currentIndex()
         flick = abs(self._velocity) > 0.5  # быстрый свайп — как в iOS
         target = idx
@@ -583,7 +592,7 @@ class PageSwiper(QObject):
 
     def snap_to(self, target_index: int):
         idx = self.stack.currentIndex()
-        w = max(1, self.stack.width())
+        w = max(1, self.host.width())
         start_off = self._offset
         end_off = (idx - target_index) * w
         if target_index != idx:
@@ -616,6 +625,211 @@ class PageSwiper(QObject):
         for pg in self._page_widgets():
             if pg is not None:
                 pg.move(off, 0)
+
+
+# =============================================================================
+# App Library: плитка категории + развёрнутый вид с реальными иконками
+# =============================================================================
+
+class LibCategoryTile(QWidget):
+    """Папка-категория App Library: squircle 2x2/3x3 миниатюр + название.
+    Тап разворачивает категорию во весь экран библиотеки (сетка приложений),
+    collapse() сворачивает обратно."""
+
+    def __init__(self, title, app_ids, parent=None, launcher=None):
+        super().__init__(parent)
+        self.title = title
+        self.app_ids = list(app_ids)
+        self._launcher = launcher
+        self._expanded_view = None
+        self.setFixedSize(170, 205)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(4, 4, 4, 4)
+        lay.setSpacing(6)
+
+        self.icon_box = QWidget(self)
+        self.icon_box.setCursor(QCursor(Qt.PointingHandCursor))
+        self.icon_box.setMinimumHeight(155)
+        self.icon_box.mousePressEvent = lambda ev: self._on_press(ev)
+        lay.addWidget(self.icon_box, 1)
+
+        name = QLabel(title, self)
+        name.setAlignment(Qt.AlignHCenter | Qt.AlignTop)
+        name.setStyleSheet(
+            "color: rgba(255,255,255,0.95); font-size: 12px; font-weight: 600;"
+            "font-family: 'SF Pro Text','Segoe UI',sans-serif; background: transparent;")
+        lay.addWidget(name)
+
+    def _on_press(self, event):
+        if self._launcher is not None:
+            self._launcher.expand_library_category(self)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setRenderHint(QPainter.SmoothPixmapTransform)
+        box = QRectF(4, 4, self.width() - 8, self.height() - 40)
+        path = make_squircle_path(box, 0.225)
+        painter.setClipPath(path)
+        grad = QLinearGradient(box.topLeft(), box.bottomRight())
+        grad.setColorAt(0.0, QColor(92, 96, 118, 215))
+        grad.setColorAt(1.0, QColor(52, 56, 74, 215))
+        painter.fillRect(box, QBrush(grad))
+
+        if self._launcher is None:
+            return
+        ids = [a for a in self.app_ids][:9]
+        grid_n = 2 if len(ids) <= 4 else 3
+        pad = 14.0
+        cell = (min(box.width(), box.height()) - pad * 2) / grid_n
+        gap = cell * 0.14
+        start_x = box.center().x() - grid_n * cell / 2
+        start_y = box.center().y() - grid_n * cell / 2
+        for i, aid in enumerate(ids):
+            data = self._launcher._app_data(aid)
+            if data is None:
+                continue
+            pm = QPixmap(data[2])
+            if pm.isNull():
+                continue
+            side = cell - gap
+            cx = start_x + (i % grid_n) * cell + gap / 2
+            cy = start_y + (i // grid_n) * cell + gap / 2
+            scaled = pm.scaled(int(side), int(side), Qt.IgnoreAspectRatio,
+                               Qt.SmoothTransformation)
+            r = QRectF(cx, cy, side, side)
+            p2 = QPainterPath()
+            p2.addRoundedRect(r, side * 0.225, side * 0.225)
+            painter.save()
+            painter.setClipPath(p2)
+            painter.drawPixmap(r, scaled,
+                               QRectF(0, 0, scaled.width(), scaled.height()))
+            painter.restore()
+
+    # ---- разворот / сворачивание категории ----
+    def expand(self):
+        if self._expanded_view is not None:
+            return
+        host = self._launcher.library_overlay if self._launcher else None
+        if host is None:
+            return
+        view = LibExpandedView(self, host)
+        view.setGeometry(host.rect())
+        view.show()
+        view.raise_()
+        self._expanded_view = view
+
+        eff = QGraphicsOpacityEffect(view)
+        view.setGraphicsEffect(eff)
+        src_local = QRect(self.mapTo(host, self.rect().topLeft()),
+                          self.size())
+
+        def frame(p):
+            e = Easing.IOS_LAUNCH.getPoint(p)
+            x = src_local.x() + (0 - src_local.x()) * e
+            y = src_local.y() + (0 - src_local.y()) * e
+            w = max(1, int(src_local.width() + (host.width() - src_local.width()) * e))
+            h = max(1, int(src_local.height() + (host.height() - src_local.height()) * e))
+            view.setGeometry(int(x), int(y), w, h)
+            eff.setOpacity(min(1.0, p * 2.0))
+
+        def finish():
+            view.setGeometry(host.rect())
+            view.setGraphicsEffect(None)
+
+        drv = _FrameDriver(Duration.SHORT, Easing.IOS_LAUNCH, frame, finish, view)
+        drv.start()
+
+    def collapse(self, instant=False):
+        view = self._expanded_view
+        if view is None:
+            return
+        self._expanded_view = None
+        if instant:
+            view.deleteLater()
+            return
+        host = self._launcher.library_overlay if self._launcher else None
+        eff = QGraphicsOpacityEffect(view)
+        view.setGraphicsEffect(eff)
+        dst = QRect(self.mapTo(view, QPoint(0, 0)), self.size()) \
+            if host is not None else view.rect()
+
+        def frame(p):
+            e = Easing.ACCELERATE.getPoint(p) if hasattr(Easing.ACCELERATE, "getPoint") else p
+            w = max(1, int(view.width() - (view.width() - dst.width()) * e))
+            h = max(1, int(view.height() - (view.height() - dst.height()) * e))
+            view.move(int(dst.x() * e), int(dst.y() * e))
+            view.resize(w, h)
+            eff.setOpacity(1.0 - e)
+
+        def finish():
+            view.deleteLater()
+
+        drv = _FrameDriver(180, Easing.ACCELERATE, frame, finish, view)
+        drv.start()
+
+
+class LibExpandedAppIcon(IOSAppIcon):
+    """Иконка приложения внутри раскрытой категории библиотеки: тап
+    запускает приложение (через тот же zoom-морф, что и домашний экран)."""
+
+    def mouseReleaseEvent(self, event):
+        if event.button() != Qt.LeftButton:
+            return
+        self._spring.to(1.0, Duration.SHORT, Easing.SPRING)
+        launcher = self._find_launcher()
+        if launcher is not None:
+            g_tl = self.mapToGlobal(self.rect().topLeft())
+            launcher.launch_from_library_tile(
+                self, QRect(g_tl, self.rect().size()))
+
+
+class LibExpandedView(QWidget):
+    """Развёрнутая категория: крупный заголовок + сетка реальных иконок."""
+
+    def __init__(self, tile, host_parent):
+        super().__init__(host_parent)
+        self.tile = tile
+        self.setObjectName("libExpanded")
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        self.setStyleSheet("background: rgba(16,18,28,250); border-radius: 34px;")
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(22, 44, 22, 20)
+        lay.setSpacing(16)
+
+        title = QLabel(tile.title)
+        title.setStyleSheet(
+            "color: white; font-size: 24px; font-weight: 700;"
+            "font-family: 'SF Pro Display','Segoe UI',sans-serif;"
+            "background: transparent;")
+        lay.addWidget(title)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setStyleSheet("QScrollArea{background:transparent;border:none;}"
+                             "QScrollBar{width:0px;}")
+        inner = QWidget()
+        inner.setStyleSheet("background: transparent;")
+        vlay = QVBoxLayout(inner)
+        vlay.setContentsMargins(4, 8, 4, 8)
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(16)
+        grid.setVerticalSpacing(22)
+        grid.setAlignment(Qt.AlignTop | Qt.AlignHCenter)
+        launcher = tile._launcher
+        cols = 4
+        for i, aid in enumerate(tile.app_ids):
+            data = launcher._app_data(aid) if launcher else None
+            if data is None:
+                continue
+            ic = LibExpandedAppIcon(aid, launcher._localized(aid) or data[1],
+                                    data[2], inner, draw_size=64, show_name=True)
+            grid.addWidget(ic, i // cols, i % cols)
+        vlay.addLayout(grid)
+        vlay.addStretch(1)
+        scroll.setWidget(inner)
+        lay.addWidget(scroll, 1)
 
 
 # =============================================================================
@@ -770,10 +984,12 @@ class IOSLauncherContent(QFrame):
             self.home_pages.append((pg, grid, header))
             self.stack.addWidget(pg)
 
-        # точки-пагинатор (как iOS page dots)
-        self.dots = QLabel(self.pages_host)
+        # точки-пагинатор (как iOS page dots) — НЕ внутри pages_host,
+        # иначе они наслаивались на док и ездили вместе со свайпом страниц
+        self.dots = QLabel(self)
         self.dots.setStyleSheet("color: rgba(255,255,255,0.55); font-size: 14px;")
         self.dots.setAlignment(Qt.AlignCenter)
+        self.dots.setAttribute(Qt.WA_TransparentForMouseEvents)
 
         # док — стеклянная капсула с blur, ПОВЕРХ страниц (как в iOS).
         # Сам blur-фон прозрачен для мыши, клики по иконкам дока работают.
@@ -803,17 +1019,37 @@ class IOSLauncherContent(QFrame):
         self.library_overlay = None
         self._library_cats = None
 
-        self.swiper = PageSwiper(self.stack, self)
+        self.swiper = PageSwiper(self.pages_host, self)
 
         self._populate_home_pages()
         self._populate_dock()
         self._update_localization()
         self._update_dots()
 
+        # фиксированный порядок слоёв: страницы → док → точки → кнопка
+        # библиотеки (без бесконечного взаимного raise_()/наслаивания)
+        self.pages_host.raise_()
+        self.dock_blur.raise_()
+        self.dots.raise_()
+        self.lib_button.raise_()
+
         # таймер обновления blur под дока (дешёвый: раз в ~450 мс только если видно)
         self._blur_timer = QTimer(self)
         self._blur_timer.setInterval(450)
         self._blur_timer.timeout.connect(lambda: self.dock_blur.refresh())
+
+    # ----------------------------------------------------------- page opacity
+    def _page_opacity_effect(self, pg):
+        """QGraphicsOpacityEffect создаётся один раз и переиспользуется."""
+        eff = pg.graphicsEffect()
+        if not isinstance(eff, QGraphicsOpacityEffect):
+            eff = QGraphicsOpacityEffect(pg)
+            pg.setGraphicsEffect(eff)
+        return eff
+
+    def _set_pages_opacity(self, value):
+        for pg in [h[0] for h in self.home_pages]:
+            self._page_opacity_effect(pg).setOpacity(max(0.0, min(1.0, value)))
 
     # ------------------------------------------------------------------ utils
     def _localized(self, app_id):
@@ -828,13 +1064,22 @@ class IOSLauncherContent(QFrame):
         return None
 
     # ------------------------------------------------------------- app library
+    def _app_data(self, app_id):
+        return next((a for a in self.apps_data if a[0] == app_id), None)
+
+    def launch_from_library_tile(self, tile, global_rect: QRect):
+        """Тап по иконке внутри раскрытой категории библиотеки — запускает
+        приложение ровно так же, как с домашнего экрана (zoom-морф в экран)."""
+        self.launch_from_icon(tile.app_id, global_rect, tile)
+
     def _build_app_library(self):
         """Полноэкранный оверлей App Library в стиле iOS 14+:
         заголовок + поиск, сетка 2x2 из папок-категорий (squircle с 9
         миниатюрами), тап по категории раскрывает её в сетку приложений,
         кнопка «назад» сворачивает обратно."""
         pg = QWidget()
-        pg.setStyleSheet("background: transparent;")
+        pg.setAttribute(Qt.WA_StyledBackground, True)
+        pg.setStyleSheet("background: rgba(16,18,28,242);")
         lay = QVBoxLayout(pg)
         lay.setContentsMargins(22, 36, 22, 10)
         lay.setSpacing(12)
@@ -860,6 +1105,17 @@ class IOSLauncherContent(QFrame):
             "font-family: 'SF Pro Display','Segoe UI',sans-serif;"
             "background: transparent;")
         top.addWidget(title, 1)
+
+        close_btn = QPushButton("\u2715", pg)
+        close_btn.setObjectName("libClose")
+        close_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        close_btn.setFixedSize(34, 34)
+        close_btn.setStyleSheet(
+            "QPushButton { color: white; font-size: 15px;"
+            " background: rgba(118,118,128,0.5); border: none; border-radius: 17px; }"
+            "QPushButton:hover { background: rgba(118,118,128,0.75); }")
+        close_btn.clicked.connect(self.close_library)
+        top.addWidget(close_btn)
         lay.addLayout(top)
 
         search = QLineEdit()
@@ -902,7 +1158,7 @@ class IOSLauncherContent(QFrame):
         grid2 = QGridLayout()
         grid2.setSpacing(22)
         for ci, (cat, ids) in enumerate(cats):
-            fold = LibCategoryTile(cat, ids, inner, self)
+            fold = LibCategoryTile(cat, ids, inner, launcher=self)
             grid2.addWidget(fold, ci // 2, ci % 2)
             self._library_tiles.append(fold)
         ilay.addLayout(grid2)
@@ -942,7 +1198,7 @@ class IOSLauncherContent(QFrame):
             shift = -int(self.width() * 0.35 * e)
             for pg in [h[0] for h in self.home_pages]:
                 pg.move(shift, 0)
-                pg.setOpacity(1.0 - e)
+                self._page_opacity_effect(pg).setOpacity(1.0 - e)
             # библиотека въезжает справа + scale-in
             x = int(self.width() * (1.0 - e))
             s = start_scale + (1.0 - start_scale) * e
@@ -960,7 +1216,7 @@ class IOSLauncherContent(QFrame):
             ov.setGeometry(self.rect())
             for pg in [h[0] for h in self.home_pages]:
                 pg.move(0, 0)
-                pg.setOpacity(0.0)  # скрыты под библиотекой
+                self._page_opacity_effect(pg).setOpacity(0.0)  # скрыты под библиотекой
             self._lib_driver = None
 
         self._lib_driver = _FrameDriver(Duration.TRANSITION, Easing.IOS_TRANSITION,
@@ -974,8 +1230,8 @@ class IOSLauncherContent(QFrame):
         self.overlay_active = False
         self.lib_button.setEnabled(True)
         for pg in [h[0] for h in self.home_pages]:
-            pg.setOpacity(1.0)
             pg.show()
+        self._set_pages_opacity(1.0)
         self._update_dots()
 
         base_geo = ov.geometry()
@@ -987,14 +1243,14 @@ class IOSLauncherContent(QFrame):
             shift = -int(self.width() * 0.35 * (1.0 - e))
             for pg in [h[0] for h in self.home_pages]:
                 pg.move(shift, 0)
-                pg.setOpacity(e)
+                self._page_opacity_effect(pg).setOpacity(e)
 
         def finish():
             ov.hide()
             ov.move(0, 0)
             for pg in [h[0] for h in self.home_pages]:
                 pg.move(0, 0)
-                pg.setOpacity(1.0)
+                self._page_opacity_effect(pg).setOpacity(1.0)
             self._lib_driver = None
             self._library_go_home(instant=True)
 
@@ -1200,6 +1456,8 @@ class IOSLauncherContent(QFrame):
 
     def launch_from_icon(self, app_id: str, global_rect: QRect, src_widget):
         """iOS zoom-transition: морф иконки в экран + fade+scale лаунчера."""
+        if self._launch_out_driver is not None or not self.isVisible():
+            return  # запуск уже в процессе — не перезапускаем (двойной тап)
         self.current_app_id_to_launch = app_id
         self.current_icon_rect_for_animation = global_rect
 
@@ -1552,8 +1810,21 @@ class IOSLauncherContent(QFrame):
         super().mouseReleaseEvent(event)
 
     # ---------------------------------------------------------------- painting
+    def _page_widgets(self):
+        return [self.stack.widget(i) for i in range(self.stack.count())]
+
+    def _layout_pages_host(self):
+        """QStackedLayout в режиме StackAll не гарантирует корректную
+        геометрию всех страниц — раскладываем их вручную на весь экран,
+        иначе страницы нулевой высоты наслаиваются друг на друга."""
+        self.pages_host.setGeometry(0, 0, self.width(), self.height())
+        for pg in self._page_widgets():
+            if pg is not None:
+                pg.setGeometry(0, 0, self.width(), self.height())
+
     def resizeEvent(self, event):
         super().resizeEvent(event)
+        self._layout_pages_host()
         # док и точки — поверх страниц, внизу
         dw = min(500, self.width() - 40)
         dh = 92
@@ -1562,10 +1833,14 @@ class IOSLauncherContent(QFrame):
         self.dock_inner.setGeometry(0, 0, dw, dh)
         self.dots.resize(self.width(), 20)
         self.dots.move(0, self.height() - dh - 44)
+        self.lib_button.move(self.width() - 44, self.height() - dh - 40)
         if self._folder_overlay is not None:
             self._folder_overlay.setGeometry(self.rect())
         if self._spotlight is not None:
             self._spotlight.setGeometry(self.rect())
+        ov = getattr(self, "library_overlay", None)
+        if ov is not None and ov.isVisible():
+            ov.setGeometry(self.rect())
 
     def paintEvent(self, event):
         """Обои в стиле iOS Default (graphite + цветные радиальные пятна)."""
@@ -1662,6 +1937,7 @@ class IOSLauncherContent(QFrame):
     def showEvent(self, event):
         super().showEvent(event)
         self._blur_timer.start()
+        QTimer.singleShot(0, self._layout_pages_host)
         if self._should_animate_on_show:
             self.animate_icons_in()
             self._should_animate_on_show = False

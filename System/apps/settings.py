@@ -29,8 +29,8 @@ except ImportError:
 
 # URL для проверки обновлений на GitHub (заглушка)
 # Замените на реальный репозиторий при необходимости
-GITHUB_UPDATE_JSON_URL = "https://raw.githubusercontent.com/username/repo/main/update.json"
-GITHUB_RELEASE_ZIP_URL = "https://github.com/username/repo/releases/download/{version}/update.zip"
+GITHUB_UPDATE_JSON_URL = "https://raw.githubusercontent.com/Kraits7/HIXOS/main/update.json"
+GITHUB_RELEASE_ZIP_URL = "https://github.com/Kraits7/HIXOS/releases/download/{version}/update.zip"
 
 # Рабочий поток для проверки обновлений
 class UpdateChecker(QThread):

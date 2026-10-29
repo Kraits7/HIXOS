@@ -758,10 +758,24 @@ class MainWindow(QMainWindow):
             self.launcher_page._current_icon_size = self.launcher_icon_size
             self.launcher_page._current_grid_columns = self.launcher_grid_columns
             self.launcher_page._show_app_names = self.launcher_show_app_names
-            self.launcher_page._populate_grid_apps() # Перестроить сетку с новыми параметрами
-            self.launcher_page._populate_dock_apps() # Перестроить док
+            self._rebuild_launcher_grid() # Перестроить сетку/док с новыми параметрами
             
             self.show_lock_screen_page() 
+
+    def _rebuild_launcher_grid(self):
+        """Перестройка сетки/дока — совместимо со старым LauncherContent
+        (_populate_grid_apps/_populate_dock_apps) и новым IOSLauncherContent."""
+        lp = self.launcher_page
+        if hasattr(lp, "_populate_home_pages"):
+            # новый iOS-лаунчер: пересборка домашних страниц + дока + локализация
+            lp._populate_home_pages()
+            lp._populate_dock()
+            lp._update_localization()
+        else:
+            if hasattr(lp, "_populate_grid_apps"):
+                lp._populate_grid_apps()
+            if hasattr(lp, "_populate_dock_apps"):
+                lp._populate_dock_apps()
 
     def show_lock_screen_page(self):
         self.power_state = self.LOCKED

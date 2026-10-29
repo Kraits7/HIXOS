@@ -24,7 +24,7 @@ import uuid # For UUID generation
 # import firebase_admin 
 
 # Imports of your applications and UI elements
-from apps.launcher import LauncherContent
+from apps.ios_launcher import IOSLauncherContent as LauncherContent
 from ui.statusbar import StatusBarWidget
 from apps.settings import SettingsContent
 from apps.oobe import OOBEContent
